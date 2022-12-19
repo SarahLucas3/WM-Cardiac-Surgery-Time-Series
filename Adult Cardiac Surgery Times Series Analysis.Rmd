@@ -1970,49 +1970,4 @@ ProcedureTable
 save_as_docx(ProcedureTable, path = "ProcedureTable.docx")
 
 ```
-# Hierarchical time series
-
-```{r fig.width=12, fig.height=8}
-library(fable.prophet)
-
-detach(package:forecast,unload=TRUE)
-
-t<-cardiacsurgery_tsb %>%
-    aggregate_key(Der_Provider_Code, Total = sum(Admissions)) %>%
- mutate (., ds = Month, y = Total)
-
-t_tr <- t %>%
-  stretch_tsibble(.init = 36, .step = 6)
-
-fit <- t_tr %>%
-  model(base = prophet(log(y)~season("year")+holiday(Lockdowns))) %>%
-  reconcile(
-    ols = min_trace(base, method = "ols"))%>% 
-  forecast(h = "1 year")%>%
-  accuracy(t, by = c(".model")) 
-
-
-t<-cardiacsurgery_tsb %>%
-    aggregate_key(Der_Provider_Code, Total = sum(Admissions)) %>%
- mutate (., ds = Month, y = Total)
-
-
-
-fit <- t %>%
-  model(base = prophet(log(y)~season("year")+holiday(Lockdowns))) %>%
-  reconcile(  ols = min_trace(base, method = "ols")
-  )
-
-fc<-fit%>%
-  forecast(h = "5 years")
-
-fc %>%
-  autoplot() +
-  facet_wrap(vars(Der_Provider_Code), scales = "free_y")
-
-  #  bu = bottom_up(base)
-   # mint = min_trace(base, method = "mint_shrink")
-     td = top_down(base)
-    ols = min_trace(base, method = "ols")
-```
 
