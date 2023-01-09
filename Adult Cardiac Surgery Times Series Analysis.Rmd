@@ -148,7 +148,7 @@ summarise(TotalAdmit = sum(Admissions),
 ggplot(aes(x = Month)) + 
   geom_line(aes(y =TotalSpells), color = "green", size=1) +
     geom_line(aes(y =TotalAdmit), color ="black", size=1) +
-  labs( title = "Total admissions, patients and episodes",y = "Number per month", x="")+
+  labs( title = "Total admissions and Spells",y = "Number per month", x="")+
   theme_bw()+
   theme(panel.grid.major.y = element_line(color = "grey80"), panel.grid.major.x =  element_blank(), panel.grid.minor.x =  element_blank(), panel.border = element_blank(), axis.line = element_line(colour = "black", size=1),
         axis.text.x = element_text(size = 12), axis.text.y = element_text(size = 12), 
