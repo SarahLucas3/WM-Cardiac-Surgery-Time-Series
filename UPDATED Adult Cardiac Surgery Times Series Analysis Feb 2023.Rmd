@@ -1,0 +1,2016 @@
+---
+title: "Adult Cardiac Surgery Time Series Analysis"
+output: github_document
+date: '2022-10-06'
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE, warning= FALSE, message= FALSE)
+library(readr)
+library(tidyverse)
+library(lubridate)
+library(fpp3)
+library(forecast)
+library(rlang)
+library(ggpubr)
+library(reshape2)
+library(prophet)
+library(gridExtra)
+library(flextable)
+library(officer)
+
+
+
+cardiacsurgery <- read_csv(file = "cardiac.csv", col_types = cols(Date=col_date(format = "%b-%y")))
+
+# Set dates
+cardiacsurgery$Date <- make_date( year= cardiacsurgery$adm_year, month= cardiacsurgery$adm_month, day=1)
+cardiacsurgery <-cardiacsurgery %>%
+  filter(between(cardiacsurgery$Date , as.Date('2012-04-01'), as.Date('2022-09-01')))
+
+
+#Grouping variables
+cardiacsurgery$Aortic_Valve_Surgery<-(cardiacsurgery$Aortic_Valve_Replacement + cardiacsurgery$Aortic_Valve_Repair)
+cardiacsurgery$AortoVascular_Surgery<-(cardiacsurgery$AortoVascular_Surgery_Replacement + cardiacsurgery$AortoVascular_Surgery_Repair+ cardiacsurgery$AortoVascular_Surgery_Other)
+cardiacsurgery$Mitral_Valve_Surgery<-(cardiacsurgery$Mitral_Valve_Replacement + cardiacsurgery$Mitral_Valve_Repair)
+cardiacsurgery$Tricuspid_Valve_Surgery<-(cardiacsurgery$Tricuspid_Valve_Replacement + cardiacsurgery$Tricuspid_Valve_Repair)
+cardiacsurgery$Pulmonary_Valve_Surgery<-(cardiacsurgery$Pulmonary_Valve_Replacement + cardiacsurgery$Pulmonary_Valve_Repair)
+cardiacsurgery$Cardiac_Valve_Surgery<-(cardiacsurgery$Cardiac_Valve_Replacement + cardiacsurgery$Cardiac_Valve_Repair)
+cardiacsurgery <- cardiacsurgery %>%
+  mutate(.,SurgicalAVR=(cardiacsurgery$Aortic_Valve_Replacement+cardiacsurgery$Aortic_Valve_Repair-cardiacsurgery$TAVI))
+
+cardiacsurgery$Valve_Surgery<- (cardiacsurgery$Mitral_Valve_Surgery+ cardiacsurgery$Tricuspid_Valve_Surgery + cardiacsurgery$Pulmonary_Valve_Surgery + cardiacsurgery$Cardiac_Valve_Surgery)
+
+cardiacsurgery$CABG<-(cardiacsurgery$CABG+cardiacsurgery$Other_Coronary_Artery_Surgery)
+
+
+cardiacsurgery$procedures<- (cardiacsurgery$SurgicalAVR + cardiacsurgery$TAVI+ cardiacsurgery$AortoVascular_Surgery + cardiacsurgery$Mitral_Valve_Surgery + cardiacsurgery$Tricuspid_Valve_Surgery+ cardiacsurgery$Pulmonary_Valve_Surgery+ cardiacsurgery$Cardiac_Valve_Surgery +cardiacsurgery$PCI + cardiacsurgery$CABG )
+
+# Filtering only the procedures of interest
+cardiacsurgery<-subset(cardiacsurgery, cardiacsurgery$AdmissionsProcedure==1)
+
+
+# Create tsibble
+cardiacsurgery_tsb <- cardiacsurgery %>% 
+  mutate(Month = yearmonth(Date))%>%
+  as_tsibble(key=c(Der_Provider_Code, Admit_Method), index = Month)
+
+
+#Check for gaps in the data
+has_gaps(cardiacsurgery_tsb)
+scan_gaps(cardiacsurgery_tsb)
+
+#Data frame of COVID-19 lockdowns (using the 1st of the month for the start dates as we have monthly data, and so the whole month of data could be affected )
+holiday<- c("Lockdown1", "Lockdown2", "Lockdown3")
+ds<-as.Date(c("2020-03-01","2020-11-01", "2021-01-01"))
+lower_window<-c(0,0,0)
+ds_upper<-as.Date(c("2020-05-10","2020-12-02", "2021-03-08"))
+Lockdowns <- data.frame(holiday, ds, lower_window, ds_upper)
+Lockdowns$upper_window<-(ds_upper-ds)
+
+
+```
+
+# Admissions
+
+## Total admissions
+
+```{r, echo=FALSE, fig.height=4, fig.width=7}
+
+#Total admissions from April 2012 to April 2022
+cardiacsurgery_tsb %>%
+summarise(TotalAdmit = sum(Admissions)) %>%  
+ggplot(aes(x = Month, y =TotalAdmit)) + 
+  geom_smooth(method=lm, se=FALSE, col="#9d928a", linetype="dashed", size=1)+
+  geom_line(color = "#2c2825", size=1) +
+  labs( title = "Total admissions",y = "Number per month", x="")+
+  theme_bw()+
+  theme(panel.grid.major.y = element_line(color = "grey80"), panel.grid.major.x =  element_blank(), panel.grid.minor.x =  element_blank(), panel.border = element_blank(), axis.line = element_line(colour = "black", size=1),
+        axis.text.x = element_text(size = 12), axis.text.y = element_text(size = 12), 
+        axis.title.x = element_text(size = 14), axis.title.y = element_text(size = 14,vjust=2), 
+        legend.text=element_text(size=12),legend.title=element_blank(),plot.title = element_text(size=14), legend.position= c(0.85, 0.8))+          
+ scale_y_continuous(expand = c(0, 0), limits=c(0,1200, 200))
+
+
+#Testing differences between patients, admissions and episodes
+cardiacsurgery_tsb %>%
+summarise(TotalAdmit = sum(Admissions),
+          TotalPatients= sum(Patients),
+          TotalEpisodes=sum(Episodes),
+          TotalSpells=sum(Spells)) %>%  
+ggplot(aes(x = Month)) + 
+  geom_line(aes(y =TotalPatients), color = "red", size=0.5) +
+  geom_line(aes(y =TotalEpisodes), color = "blue", size=0.5) +
+  geom_line(aes(y =TotalSpells), color = "green", size=0.5) +
+    geom_line(aes(y =TotalAdmit), color ="pink", size=0.5) +
+  labs( title = "Total admissions, patients and episodes",y = "Number per month", x="")+
+  theme_bw()+
+  theme(panel.grid.major.y = element_line(color = "grey80"), panel.grid.major.x =  element_blank(), panel.grid.minor.x =  element_blank(), panel.border = element_blank(), axis.line = element_line(colour = "black", size=1),
+        axis.text.x = element_text(size = 12), axis.text.y = element_text(size = 12), 
+        axis.title.x = element_text(size = 14), axis.title.y = element_text(size = 14,vjust=2), 
+        legend.text=element_text(size=12),legend.title=element_blank(),plot.title = element_text(size=14), legend.position= c(0.85, 0.8))  
+
+
+cardiacsurgery_tsb %>%
+summarise(TotalAdmit = sum(Admissions)) %>%  
+ggplot(aes(x = Month, y =TotalAdmit)) + 
+  geom_smooth(method=lm, se=FALSE, col="#9d928a", linetype="dashed", size=1)+
+  geom_line(color = "#2c2825", size=1) +
+  labs( title = "Total admissions",y = "Number per month", x="")+
+  theme_bw()+
+  theme(panel.grid.major.y = element_line(color = "grey80"), panel.grid.major.x =  element_blank(), panel.grid.minor.x =  element_blank(), panel.border = element_blank(), axis.line = element_line(colour = "black", size=1),
+        axis.text.x = element_text(size = 12), axis.text.y = element_text(size = 12), 
+        axis.title.x = element_text(size = 14), axis.title.y = element_text(size = 14,vjust=2), 
+        legend.text=element_text(size=12),legend.title=element_blank(),plot.title = element_text(size=14), legend.position= c(0.85, 0.8))+          
+ scale_y_continuous(expand = c(0, 0), limits=c(0,1200, 200))
+
+
+#Testing differences between patients, admissions, spells and episodes
+cardiacsurgery_tsb %>%
+summarise(TotalAdmit = sum(Admissions),
+          TotalPatients= sum(Patients),
+          TotalEpisodes=sum(Episodes))%>%  
+ggplot(aes(x = Month)) + 
+  geom_line(aes(y =TotalPatients), color = "red", size=1) +
+  geom_line(aes(y =TotalEpisodes), color = "blue", size=1) +
+    geom_line(aes(y =TotalAdmit), color ="black", size=1) +
+  labs( title = "Total admissions, patients and episodes",y = "Number per month", x="")+
+  theme_bw()+
+  theme(panel.grid.major.y = element_line(color = "grey80"), panel.grid.major.x =  element_blank(), panel.grid.minor.x =  element_blank(), panel.border = element_blank(), axis.line = element_line(colour = "black", size=1),
+        axis.text.x = element_text(size = 12), axis.text.y = element_text(size = 12), 
+        axis.title.x = element_text(size = 14), axis.title.y = element_text(size = 14,vjust=2), 
+        legend.text=element_text(size=12),legend.title=element_blank(),plot.title = element_text(size=14), legend.position= c(0.85, 0.8))  
+
+cardiacsurgery_tsb %>%
+summarise(TotalAdmit = sum(Admissions),
+          TotalSpells=sum(Spells)) %>%  
+ggplot(aes(x = Month)) + 
+  geom_line(aes(y =TotalSpells), color = "green", size=1) +
+    geom_line(aes(y =TotalAdmit), color ="black", size=1) +
+  labs( title = "Total admissions and Spells",y = "Number per month", x="")+
+  theme_bw()+
+  theme(panel.grid.major.y = element_line(color = "grey80"), panel.grid.major.x =  element_blank(), panel.grid.minor.x =  element_blank(), panel.border = element_blank(), axis.line = element_line(colour = "black", size=1),
+        axis.text.x = element_text(size = 12), axis.text.y = element_text(size = 12), 
+        axis.title.x = element_text(size = 14), axis.title.y = element_text(size = 14,vjust=2), 
+        legend.text=element_text(size=12),legend.title=element_blank(),plot.title = element_text(size=14), legend.position= c(0.85, 0.8))  
+
+
+
+```
+
+## Elective vs non-elective admissions
+
+```{r, echo=FALSE, fig.height=4, fig.width=7}
+
+#Elective and non-elective admissions from April 2012 to April 2022
+cardiacsurgery_tsb %>%
+  group_by(Admit_Method)%>%
+summarise(TotalAdmit = sum(Admissions)) %>%  
+ggplot(aes(x = Month, y =TotalAdmit, group=Admit_Method)) + 
+  geom_smooth(se=FALSE, col="#9d928a", linetype="dashed", size=1)+
+  geom_line(aes(color=Admit_Method), size=1) +
+  labs( title = "Elective vs Non-elective admissions",y = "Number per month", x="")+
+  theme_bw()+
+  theme(panel.grid.major.y = element_line(color = "grey80"), panel.grid.major.x =  element_blank(), panel.grid.minor.x =  element_blank(), panel.border = element_blank(), axis.line = element_line(colour = "black", size=1),
+        axis.text.x = element_text(size = 12), axis.text.y = element_text(size = 12), 
+        axis.title.x = element_text(size = 14), axis.title.y = element_text(size = 14,vjust=2), 
+        legend.text=element_text(size=12),legend.title=element_blank(),plot.title = element_text(size=14), legend.position= c(0.15, 0.88))+
+  scale_color_manual(values=c("#2c2825", "#ec6555"))+          
+ scale_y_continuous(expand = c(0, 0), limits=c(0,1000, 200))
+      
+
+```
+
+```{r, echo=FALSE, fig.height=2, fig.width=7}
+
+#Ratio of elective to non-elective admissions
+cardiacsurgery%>%
+  group_by(Admit_Method, adm_year)%>%
+summarise(TotalAdmit = sum(Admissions)/n_distinct(adm_month)) %>%
+  spread(., Admit_Method, TotalAdmit)%>%
+  mutate(., ratio=Elective/`Non-elective`) %>%
+ggplot(aes(x =  adm_year, y =ratio)) + 
+  geom_line(color="blue", size=1)  + 
+  geom_point(color="blue", size=2)+
+  labs( title = "Ratio of elective to non-elective admissions",y = "Ratio", x="")+
+  theme_bw()+
+  theme(panel.grid.major.y = element_line(color = "grey80"), panel.grid.major.x =  element_blank(), panel.grid.minor.x =  element_blank(), panel.border = element_blank(), axis.line = element_line(colour = "black", size=1),
+        axis.text.x = element_text(size = 12), axis.text.y = element_text(size = 12), 
+        axis.title.x = element_text(size = 14), axis.title.y = element_text(size = 14,vjust=2), 
+        legend.text=element_text(size=12),legend.title=element_blank(),plot.title = element_text(size=14), legend.position= c(0.15, 0.8)) +
+  scale_y_continuous(expand = c(0, 0), limits=c(0,1))
+
+```
+
+
+
+# Numbers of Procedures
+
+## Total procedures (elective and non-elective)
+
+```{r, echo=FALSE, fig.height=9, fig.width=8}
+
+summary_variables<-c("SurgicalAVR","TAVI","Valve_Surgery" ,"AortoVascular_Surgery", "CABG", "PCI" )
+
+plot.list = list()
+
+for (var in summary_variables){
+  p<- cardiacsurgery_tsb%>%
+    summarise(., Total = sum(!!sym(var)))%>%
+ggplot(aes(cardiacsurgery_tsb, x = Month, y =Total)) + 
+  geom_line(color = "#2c2825", size=0.8) +
+  labs(title=paste("", var, sep=" "), y = "Number per month", x="")+
+  theme_bw()+
+  theme(panel.grid.major.y = element_line(color = "grey80"), panel.grid.major.x =  element_blank(), panel.grid.minor.x =  element_blank(), panel.border = element_blank(), axis.line = element_line(colour = "black", size=1),
+        axis.text.x = element_text(size = 12, angle=25, hjust=0.8), axis.text.y = element_text(size = 12), 
+        axis.title.x = element_blank(), axis.title.y = element_text(size = 13.5,vjust=2)) + 
+    expand_limits(y = 0)   
+    #print(p)
+      plot.list[[var]] = p
+}
+
+grid.arrange(grobs=plot.list, ncol=2)
+
+
+```
+
+
+
+## Elective and Non-Elective procedures 
+
+```{r, echo=FALSE, fig.height=6, fig.width=12}
+
+
+summary_variables<-c("SurgicalAVR","TAVI","Valve_Surgery" ,"AortoVascular_Surgery", "CABG", "PCI" )
+
+plot.list = list()
+
+cardiacsurgery$adm_year<-lubridate::ymd(cardiacsurgery$adm_year, truncated = 2L)
+
+for (var in summary_variables){
+  p<-    cardiacsurgery %>%
+    group_by(adm_year, Admit_Method) %>%
+    summarise(., MonthlyMean = sum(!!sym(var))/n_distinct(adm_month))%>%
+ggplot(aes(cardiacsurgery, x = adm_year, y =MonthlyMean, group=Admit_Method)) + 
+  geom_line(aes(color=Admit_Method), size=0.8) +
+       geom_point(aes(color=Admit_Method), size=1.7) + 
+  labs(title=paste("", var, sep=" "), y = "Average number/month")+
+  theme_bw()+
+  theme(panel.grid.major.y = element_line(color = "grey80"), panel.grid.major.x =  element_blank(), panel.grid.minor.x =  element_blank(), panel.border = element_blank(), axis.line = element_line(colour = "black", size=1),
+        axis.text.x = element_text(size = 12), axis.text.y = element_text(size = 12), 
+        axis.title.x = element_blank(), axis.title.y = element_text(size = 13.5,vjust=2),
+        legend.position="bottom"  , legend.direction = "horizontal", legend.title =element_blank(), legend.text=element_text(size=11))+
+      scale_color_manual(values=c("#2c2825", "#ec6555"))  + 
+    expand_limits(y = 0)   
+    #print(p)
+      plot.list[[var]] = p
+}
+
+grid.arrange(grobs=plot.list, ncol=3)
+
+
+
+
+for (var in summary_variables){
+  p<- cardiacsurgery_tsb %>%
+     group_by(Admit_Method) %>%
+    summarise(., Total = sum(!!sym(var)))%>%
+ggplot(aes(cardiacsurgery_tsb, x = Month, y =Total, group=Admit_Method)) + 
+  geom_line(aes(color=Admit_Method), size=0.8) +
+  labs(title=paste("", var, sep=" "), y = "Number per month", x="")+
+  theme_bw()+
+  theme(panel.grid.major.y = element_line(color = "grey80"), panel.grid.major.x =  element_blank(), panel.grid.minor.x =  element_blank(), panel.border = element_blank(), axis.line = element_line(colour = "black", size=1),
+        axis.text.x = element_text(size = 12, angle=25, hjust=0.8), axis.text.y = element_text(size = 12), 
+        axis.title.x = element_blank(), axis.title.y = element_text(size = 13.5,vjust=2),
+        legend.position="bottom"  , legend.direction = "horizontal", legend.title =element_blank(), legend.text=element_text(size=11)) + 
+      scale_color_manual(values=c("#2c2825", "#ec6555"))  + 
+    expand_limits(y = 0)   
+   # print(p)
+     plot.list[[var]] = p
+}
+
+grid.arrange(grobs=plot.list, ncol=3)
+
+
+
+```
+
+
+
+
+
+```{r, include=FALSE, fig.height=4, fig.width=7}
+
+## Ratio of PCI/CABG procedures (elective and non-elective)
+
+#Plot of PCI and CABG procedures
+cardiacsurgery_tsb %>%
+  summarise(PCI = sum(PCI),CABG = sum(CABG)) %>% 
+  gather("Procedure", "value") %>%
+ggplot(aes(x = Month, y =value, group=Procedure)) + 
+  geom_line(aes(color= Procedure), size=1) +
+  labs( title = "PCI and CABG procedures",y = "Number per month", x="")+
+  theme_bw()+
+  theme(panel.grid.major.y = element_line(color = "grey80"), panel.grid.major.x =  element_blank(), panel.grid.minor.x =  element_blank(), panel.border = element_blank(), axis.line = element_line(colour = "black", size=1),
+        axis.text.x = element_text(size = 12), axis.text.y = element_text(size = 12), 
+        axis.title.x = element_text(size = 14), axis.title.y = element_text(size = 14,vjust=2), 
+        legend.text=element_text(size=12),legend.title=element_blank(),plot.title = element_text(size=14), legend.position= c(0.1, 0.13)) +        
+  scale_color_manual(values=c( "red", "#2c2825"))
+
+#Ratio of PCI/CABG procedures
+cardiacsurgery%>%
+     group_by(adm_year)%>%
+  summarise(TotalPCI = sum(PCI),TotalCABG = sum(CABG)) %>% 
+  mutate(., ratio=TotalPCI/TotalCABG) %>%
+ggplot(aes(x =adm_year, y =ratio)) + 
+  geom_line(color="blue", size=1) +
+  geom_point(color="blue", size=2) +
+  labs( title = "Ratio of PCI/CABG procedures",y = "Ratio", x="")+
+  theme_bw()+
+  theme(panel.grid.major.y = element_line(color = "grey80"), panel.grid.major.x =  element_blank(), panel.grid.minor.x =  element_blank(), panel.border = element_blank(), axis.line = element_line(colour = "black", size=1),
+        axis.text.x = element_text(size = 12), axis.text.y = element_text(size = 12), 
+        axis.title.x = element_text(size = 14), axis.title.y = element_text(size = 14,vjust=2), 
+        legend.text=element_text(size=12),legend.title=element_blank(),plot.title = element_text(size=14),      legend.position= c(0.15, 0.8)) +
+  scale_y_continuous(expand = c(0, 0), limits=c(0,5.1, 0.2))
+
+
+
+```
+
+
+
+```{r, include=FALSE, fig.height=4, fig.width=7}
+
+## Ratio of TAVI/open AVR (elective and non-elective)
+
+#Plot of TAVI to Open AVR
+cardiacsurgery_tsb %>%
+  summarise(TAVI = sum(TAVI),AVR = sum(SurgicalAVR)) %>% 
+  gather("Procedure", "value") %>%
+ggplot(aes(x = Month, y =value, group=Procedure)) + 
+  geom_line(aes(color= Procedure), size=1) +
+  labs( title = "TAVI and open AVR procedures",y = "Number per month", x="")+
+  theme_bw()+
+  theme(panel.grid.major.y = element_line(color = "grey80"), panel.grid.major.x =  element_blank(), panel.grid.minor.x =  element_blank(), panel.border = element_blank(), axis.line = element_line(colour = "black", size=1),
+        axis.text.x = element_text(size = 12), axis.text.y = element_text(size = 12), 
+        axis.title.x = element_text(size = 14), axis.title.y = element_text(size = 14,vjust=2), 
+        legend.text=element_text(size=12),legend.title=element_blank(),plot.title = element_text(size=14),      legend.position= c(0.1, 0.35)) +  
+  scale_y_continuous(expand = c(0, 0), limits=c(0,165, 0.2)) +                  
+  scale_color_manual(values=c( "red", "#2c2825"))
+
+#Ratio of TAVI/AVR
+cardiacsurgery %>%
+  group_by(adm_year)%>%
+  summarise(TotalTAVI = sum(TAVI),TotalSurgicalAVR = sum(SurgicalAVR)) %>% 
+  mutate(., ratio=TotalTAVI/TotalSurgicalAVR) %>%
+ggplot(aes(x = adm_year, y =ratio)) + 
+  geom_line(color="blue", size=1) +
+  geom_point(color="blue", size=2) +
+  labs( title = "Ratio of TAVI/AVR procedures",y = "Ratio", x="")+
+  theme_bw()+
+  theme(panel.grid.major.y = element_line(color = "grey80"), panel.grid.major.x =  element_blank(), panel.grid.minor.x =  element_blank(), panel.border = element_blank(), axis.line = element_line(colour = "black", size=1),
+        axis.text.x = element_text(size = 12), axis.text.y = element_text(size = 12), 
+        axis.title.x = element_text(size = 14), axis.title.y = element_text(size = 14,vjust=2), 
+        legend.text=element_text(size=12),legend.title=element_blank(),plot.title = element_text(size=14),legend.position= c(0.15, 0.8)) +
+  scale_y_continuous(expand = c(0, 0), limits=c(0,1.3, 0.2))
+
+```
+
+## Change in the type of procedures over time
+
+```{r, include=FALSE, fig.height=5, fig.width=6}
+
+# Proportion of procedures
+PercentProceduretype<-cardiacsurgery %>%
+    group_by(adm_year) %>%
+  summarise(TAVI = sum(TAVI), SurgicalAVR = sum(SurgicalAVR), Valve_Surgery=sum(Valve_Surgery), Aortovascular_Surgery=sum(AortoVascular_Surgery), CABG=sum(CABG), PCI=sum(PCI), Total=sum(TAVI, SurgicalAVR, Valve_Surgery, AortoVascular_Surgery, CABG, PCI)) %>% 
+  mutate(TAVI = (TAVI/Total)*100)%>% 
+  mutate(SurgicalAVR = (SurgicalAVR/Total)*100)%>% 
+  mutate(Valve_Surgery = (Valve_Surgery/Total)*100)%>% 
+  mutate(Aortovascular_Surgery = (Aortovascular_Surgery/Total)*100)%>% 
+  mutate(CABG = (CABG/Total)*100)%>% 
+  mutate(PCI = (PCI/Total)*100)%>%
+  dplyr::select(-Total) %>%
+  gather(., "Procedures", "value", -adm_year) 
+
+
+PercentProceduretype$Procedures<-factor(PercentProceduretype$Procedures, levels=c( "Aortovascular_Surgery",  "Valve_Surgery", "TAVI", "SurgicalAVR", "CABG", "PCI"))
+  
+ggplot(PercentProceduretype, aes(x=adm_year, y=value, fill=Procedures)) + 
+    geom_area()+
+  labs( title = "Proportion of procedures",y = "Percentage", x="")+
+  theme_bw()+
+  theme(panel.grid.major.y = element_line(color = "grey80"), panel.grid.major.x =  element_blank(), panel.grid.minor.x =  element_blank(), panel.border = element_blank(), axis.line = element_line(colour = "black", size=1),
+        axis.text.x = element_text(size = 12), axis.text.y = element_text(size = 12), 
+        axis.title.x = element_blank(), axis.title.y = element_text(size = 14,vjust=2), 
+        legend.text=element_text(size=12),legend.title=element_blank(),plot.title = element_text(size=14),legend.position="bottom") +
+  scale_y_continuous(expand = c(0, 0), limits=c(0,101, 0.2))+
+  scale_x_continuous(breaks =c(2012,2014,2016, 2018, 2020, 2022))+
+ scale_fill_manual(values=c("darkseagreen",  "#ff9933" , "#5881c1","#ec6555" ,"#b2b7b9", "#f9bf07")) 
+
+
+
+
+# Number of procedures
+NoProceduretype<-cardiacsurgery %>%
+  mutate(adm_year=as.character(adm_year)) %>%
+    group_by(adm_year) %>%
+  summarise(TAVI = sum(TAVI)/n_distinct(adm_month), SurgicalAVR = sum(SurgicalAVR)/n_distinct(adm_month), Valve_Surgery=sum(Valve_Surgery)/n_distinct(adm_month), Aortovascular_Surgery=sum(AortoVascular_Surgery)/n_distinct(adm_month), CABG=sum(CABG)/n_distinct(adm_month), PCI=sum(PCI)/n_distinct(adm_month)) %>%
+  gather(., "Procedures", "value", -adm_year) %>%
+  mutate(adm_year=as.Date(adm_year))
+
+NoProceduretype$Procedures<-factor(NoProceduretype$Procedures, levels=c( "Aortovascular_Surgery",  "Valve_Surgery", "TAVI", "SurgicalAVR", "CABG", "PCI"))
+  
+ggplot(NoProceduretype, aes(x=adm_year, y=value, fill=Procedures)) + 
+    geom_line(aes(color = Procedures), size=1.4)+
+      geom_point(aes(color = Procedures), size=2)+
+  labs( title = "Number of procedures",y = "Average number/month", x="")+
+  theme_bw()+
+  theme(panel.grid.major.y = element_line(color = "grey80"), panel.grid.major.x =  element_blank(), panel.grid.minor.x =  element_blank(), panel.border = element_blank(), axis.line = element_line(colour = "black", size=1),
+        axis.text.x = element_text(size = 12), axis.text.y = element_text(size = 12), 
+        axis.title.x = element_blank(), axis.title.y = element_text(size = 14,vjust=2), 
+        legend.text=element_text(size=12),legend.title=element_blank(),plot.title = element_text(size=14),legend.position="bottom") +
+  scale_y_continuous(expand = c(0, 0), limits=c(0,700, 0.2))+
+  scale_x_continuous(breaks =c(2012,2014,2016, 2018, 2020, 2022))+
+ scale_color_manual(values=c("darkseagreen",  "#ff9933" , "#5881c1","#ec6555" ,"#b2b7b9", "#f9bf07")) 
+
+
+
+
+
+```
+
+
+```{r, fig.height=7, fig.width=13}
+
+# Proportion of procedures by provider
+
+#Changing hospital labels
+hospital_names <- list(
+  'RJE'="University Hospitals of North Midlands",
+  'RKB'="University Hospitals Coventry & Warwickshire",
+  'RL4'="The Royal Wolverhampton",
+  'RRK'="University Hospitals Birmingham",
+  'RWE'="University Hospitals of Leicester",
+  'RX1'="Nottingham University Hospitals"
+)
+
+hospital_labeller <- function(variable,value){
+  return(hospital_names[value])
+}
+
+PercentProcedurebyProvider<-cardiacsurgery %>%
+    group_by(adm_year, Der_Provider_Code) %>%
+  summarise(TAVI = sum(TAVI), SurgicalAVR = sum(SurgicalAVR), Valve_Surgery=sum(Valve_Surgery), Aortovascular_Surgery=sum(AortoVascular_Surgery), CABG=sum(CABG), PCI=sum(PCI), Total=sum(TAVI, SurgicalAVR, Valve_Surgery, AortoVascular_Surgery, CABG, PCI)) %>% 
+  mutate(TAVI = (TAVI/Total)*100)%>% 
+  mutate(SurgicalAVR = (SurgicalAVR/Total)*100)%>% 
+  mutate(Valve_Surgery = (Valve_Surgery/Total)*100)%>% 
+  mutate(Aortovascular_Surgery = (Aortovascular_Surgery/Total)*100)%>% 
+  mutate(CABG = (CABG/Total)*100)%>% 
+  mutate(PCI = (PCI/Total)*100)%>%
+  dplyr::select(-Total) %>%
+  gather(., "Procedures", "value", -adm_year, -Der_Provider_Code) 
+
+PercentProcedurebyProvider$Procedures<-factor(PercentProcedurebyProvider$Procedures, levels=c( "Aortovascular_Surgery",  "Valve_Surgery", "TAVI", "SurgicalAVR", "CABG", "PCI"))
+
+ggplot(PercentProcedurebyProvider, aes(x=adm_year, y=value, fill=Procedures)) + 
+    geom_area()+
+  facet_wrap(vars(Der_Provider_Code), ncol=3, labeller=hospital_labeller, scales= 'free')+
+  labs( title = "Proportion of procedures",y = "Percentage", x="")+
+  theme_bw()+
+  theme(panel.grid.major.y = element_line(color = "grey80"), panel.grid.major.x =  element_blank(), panel.grid.minor.x =  element_blank(), panel.border = element_blank(), axis.line = element_line(colour = "black", size=1),
+        axis.text.x = element_text(size = 12), axis.text.y = element_text(size = 12), 
+        axis.title.x = element_blank(), axis.title.y = element_text(size = 14,vjust=2), 
+        legend.text=element_text(size=12),legend.title=element_blank(),plot.title = element_text(size=14),legend.position="bottom",
+        strip.text = element_text(size = rel(1.2)),  strip.background = element_rect(fill = "White", colour="white", size = 1)) +
+  scale_y_continuous(expand = c(0, 0), limits=c(0,101, 0.2))+
+  scale_x_continuous(breaks =c(2012,2014,2016, 2018, 2020, 2022))+
+ scale_fill_manual(values=c("darkseagreen",  "#ff9933" , "#5881c1","#ec6555" ,"#b2b7b9", "#f9bf07")) 
+
+
+
+
+
+
+
+
+```
+
+
+# By Provider
+
+## Admissions per hospital
+
+```{r, echo=FALSE, fig.height=7, fig.width=13}
+
+
+#Total Admissions per hospital between April 2012 to April 2022
+cardiacsurgery_tsb %>%
+  group_by(Der_Provider_Code)%>%
+summarise(TotalAdmit = sum(Admissions)) %>%  
+ggplot(aes(x = Month, y =TotalAdmit)) + 
+  geom_line(color="#2c2825", size=1) +
+  facet_wrap(vars(Der_Provider_Code), ncol=2, labeller=hospital_labeller)+
+  labs( title = "Total Admissions by Provider",y = "Number per month", x="")+
+  theme_bw()+
+  theme(panel.grid.major.y = element_line(color = "grey80"), panel.grid.major.x =  element_blank(), panel.border = element_blank(), axis.line = element_line(colour = "black", size=1),
+        axis.text.x = element_text(size = 11, angle=25, hjust=0.8), axis.text.y = element_text(size = 12), 
+        axis.title.x = element_text(size = 14), axis.title.y = element_text(size = 14,vjust=2), 
+        legend.text=element_text(size=12),legend.title=element_blank(),plot.title = element_text(size=14), 
+        strip.text = element_text(size = rel(1.3)),  strip.background = element_rect(fill = "White", colour="white", size = 1)) +          
+  scale_y_continuous(expand = c(0, 0), limits=c(0,350, 200)) 
+
+
+
+#Elective and non-elective admissions by provider from April 2012 to April 2022
+cardiacsurgery_tsb %>%
+  group_by(Admit_Method, Der_Provider_Code)%>%
+summarise(TotalAdmit = sum(Admissions)) %>%  
+ggplot(aes(x = Month, y =TotalAdmit, group=Admit_Method)) + 
+  geom_line(aes(color=Admit_Method), size=1) +
+   facet_wrap(vars(Der_Provider_Code), ncol=3, labeller=hospital_labeller, scales= 'free')+
+  labs( title = "Elective and Non-Elective Admissions by Provider",y = "Number per month", x="")+
+  theme_bw()+
+  theme(panel.grid.major.y = element_line(color = "grey80"), panel.grid.major.x =  element_blank(), panel.grid.minor.x =  element_blank(), panel.border = element_blank(), axis.line = element_line(colour = "black", size=1),
+        axis.text.x = element_text(size = 11, angle=25, hjust=0.8), axis.text.y = element_text(size = 12), 
+        axis.title.x = element_text(size = 14), axis.title.y = element_text(size = 14,vjust=2), 
+        legend.text=element_text(size=12),legend.title=element_blank(),plot.title = element_text(size=14), legend.position= c(0.91, 0.94),
+        strip.text = element_text(size = rel(1.25)),  strip.background = element_rect(fill = "White", colour="white", size = 1)) +           
+  scale_color_manual(values=c("#2c2825", "#ec6555"))+          
+ scale_y_continuous(expand = c(0, 0), limits=c(0,200, 200))
+
+
+
+
+
+
+
+
+
+```
+
+
+## Ratio of non-elective to elective
+
+```{r, echo=FALSE, fig.height=7, fig.width=13}
+#Ratio of non-elective to elective by hospital
+cardiacsurgery%>%
+  group_by(Admit_Method, adm_year, Der_Provider_Code)%>%
+summarise(TotalAdmit = sum(Admissions)/n_distinct(adm_month)) %>%
+  spread(., Admit_Method, TotalAdmit)%>%
+  mutate(., ratio=`Non-elective`/Elective) %>%
+ggplot(aes(x =  adm_year, y =ratio)) + 
+  geom_line(color="#5881c1", size=1)  + 
+  geom_point(color="#5881c1", size=2)+
+   facet_wrap(vars(Der_Provider_Code), ncol=3, labeller=hospital_labeller, scales= 'free')  +
+  labs( title = "Ratio of non-elective to elective admissions",y = "Ratio", x="")+
+  theme_bw()+
+  theme(panel.grid.major.y = element_line(color = "grey80"), panel.grid.major.x =  element_blank(), panel.grid.minor.x =  element_blank(), panel.border = element_blank(), axis.line = element_line(colour = "black", size=1),
+        axis.text.x = element_text(size = 12), axis.text.y = element_text(size = 12), 
+        axis.title.x = element_text(size = 14), axis.title.y = element_text(size = 14,vjust=2), 
+        legend.text=element_text(size=12),legend.title=element_blank(),plot.title = element_text(size=14), legend.position= c(0.15, 0.8),
+        strip.text = element_text(size = rel(1.25)),  strip.background = element_rect(fill = "White", colour="white", size = 1)) +
+  scale_y_continuous(expand = c(0, 0), limits=c(0,4))
+
+
+
+
+```
+
+
+
+## Average Length of Stay
+
+```{r, echo=FALSE, fig.height=5, fig.width=7}
+
+#Total LOS between April 2012 to April 2022
+ cardiacsurgery %>% 
+  group_by (Der_Provider_Code, adm_year) %>%
+ summarise(Average = (sum(epi_los)/sum(Episodes)))%>%
+  ggplot(aes(x =  adm_year , y =Average, group=Der_Provider_Code), labeller=hospital_labeller) + 
+  geom_line(aes(color = Der_Provider_Code), size=1) +
+  geom_point(aes(color = Der_Provider_Code), size=1.5) +
+  labs( title = "Average episode length of stay",y = "Length of Stay (days)", x="")+
+  theme_bw()+
+  theme(panel.grid.major.y = element_line(color = "grey80"), panel.grid.major.x =  element_blank(), panel.grid.minor.x =  element_blank(), panel.border = element_blank(), axis.line = element_line(colour = "black", size=1),
+        axis.text.x = element_text(size = 12), axis.text.y = element_text(size = 12), 
+        axis.title.x = element_blank(), axis.title.y = element_text(size = 14,vjust=2), 
+        legend.text=element_text(size=12),legend.title=element_blank(),plot.title = element_text(size=14), legend.position= "bottom") +
+       scale_y_continuous(expand = c(0, 0), limits=c(0,10, 200)) +
+ scale_color_manual(values=c("darkseagreen",  "#ff9933" , "#5881c1","#ec6555" ,"#b2b7b9", "#f9bf07"), 
+                    labels=c("North Midlands","Coventry & Warwickshire","Wolverhampton", "Birmingham", "Leicester", "Nottingham") ) 
+
+
+
+ # Weekend discharge by Provider
+cardiacsurgery%>%
+    group_by(adm_year,Der_Provider_Code ) %>%
+    summarise(., Percent = (sum(weekend_disch)/sum(Admissions))*100)%>%
+ ggplot(aes(x =  adm_year , y =Percent, group=Der_Provider_Code), labeller=hospital_labeller) + 
+  geom_line(aes(color = Der_Provider_Code), size=1) +
+    geom_point(aes(color = Der_Provider_Code), size=1.5) +
+  labs(title="Weekend discharge", y = "% of Admissions", x="")+
+  theme_bw()+
+  theme(panel.grid.major.y = element_line(color = "grey80"), panel.grid.major.x =  element_blank(), panel.grid.minor.x =  element_blank(), panel.border = element_blank(), axis.line = element_line(colour = "black", size=1),
+        axis.text.x = element_text(size = 12), axis.text.y = element_text(size = 12), 
+        axis.title.x = element_blank(), axis.title.y = element_text(size = 13.5,vjust=2),
+ legend.text=element_text(size=12),legend.title=element_blank(),plot.title = element_text(size=14), legend.position= "bottom") +
+ scale_y_continuous(expand = c(0, 0), limits=c(0,25, 20)) +
+ scale_color_manual(values=c("darkseagreen",  "#ff9933" , "#5881c1","#ec6555" ,"#b2b7b9", "#f9bf07"), 
+                    labels=c("North Midlands","Coventry & Warwickshire","Wolverhampton", "Birmingham", "Leicester", "Nottingham") ) 
+
+# Day of surgery Admission (DOSA) by Provider
+  cardiacsurgery%>%
+    filter(Admit_Method=="Elective") %>%
+    group_by(adm_year,Der_Provider_Code) %>%
+    summarise(., Percent = (sum(DOSA)/sum(Admissions))*100)%>%
+ ggplot(aes(x =  adm_year , y =Percent, group=Der_Provider_Code), labeller=hospital_labeller) + 
+  geom_line(aes(color = Der_Provider_Code), size=1) +
+    geom_point(aes(color = Der_Provider_Code), size=1.5) + 
+  labs(title="Day of surgery admission", y = "% of elective admissions", x="")+
+  theme_bw()+
+  theme(panel.grid.major.y = element_line(color = "grey80"), panel.grid.major.x =  element_blank(), panel.grid.minor.x =  element_blank(), panel.border = element_blank(), axis.line = element_line(colour = "black", size=1),
+        axis.text.x = element_text(size = 12), axis.text.y = element_text(size = 12), 
+        axis.title.x = element_blank(), axis.title.y = element_text(size = 13.5,vjust=2),
+   legend.text=element_text(size=12),legend.title=element_blank(),plot.title = element_text(size=14), legend.position= "bottom") +
+ scale_y_continuous(expand = c(0, 0), limits=c(0,80, 20))   +
+ scale_color_manual(values=c("darkseagreen",  "#ff9933" , "#5881c1","#ec6555" ,"#b2b7b9", "#f9bf07"), 
+                    labels=c("North Midlands","Coventry & Warwickshire","Wolverhampton", "Birmingham", "Leicester", "Nottingham") ) 
+    
+
+
+
+
+```
+
+
+
+
+
+
+# Outcomes (elective and non-elective)  (NEEDS UPDATING)
+
+```{r, echo=FALSE, fig.height=4, fig.width=7}
+
+# Weekend discharge
+cardiacsurgery%>%
+    group_by(adm_year) %>%
+    summarise(., Percent = (sum(weekend_disch)/sum(Admissions))*100)%>%
+ggplot(aes(cardiacsurgery, x = adm_year, y =Percent)) + 
+geom_line(color = "#2c2825", size=0.8) +
+    geom_point(color = "#2c2825", size=2) +
+  labs(title="Weekend discharge", y = "% of Admissions", x="")+
+  theme_bw()+
+  theme(panel.grid.major.y = element_line(color = "grey80"), panel.grid.major.x =  element_blank(), panel.grid.minor.x =  element_blank(), panel.border = element_blank(), axis.line = element_line(colour = "black", size=1),
+        axis.text.x = element_text(size = 12), axis.text.y = element_text(size = 12), 
+        axis.title.x = element_blank(), axis.title.y = element_text(size = 13.5,vjust=2))+         
+ scale_y_continuous(expand = c(0, 0), limits=c(0,25, 20))
+
+# Day of surgery Admission (DOSA)
+  cardiacsurgery%>%
+    filter(Admit_Method=="Elective") %>%
+    group_by(adm_year) %>%
+    summarise(., Percent = (sum(DOSA)/sum(Admissions))*100)%>%
+ggplot(aes(cardiacsurgery, x = adm_year, y =Percent)) + 
+  geom_line(color = "#2c2825", size=0.8) +
+  geom_point(color = "#2c2825", size=2) +  
+  labs(title="Day of surgery admission", y = "% of elective admissions", x="")+
+  theme_bw()+
+  theme(panel.grid.major.y = element_line(color = "grey80"), panel.grid.major.x =  element_blank(), panel.grid.minor.x =  element_blank(), panel.border = element_blank(), axis.line = element_line(colour = "black", size=1),
+        axis.text.x = element_text(size = 12), axis.text.y = element_text(size = 12), 
+        axis.title.x = element_blank(), axis.title.y = element_text(size = 13.5,vjust=2))+          
+ scale_y_continuous(expand = c(0, 0), limits=c(0,60, 20))
+
+
+ # Emergency readmissions within 30 days
+    cardiacsurgery%>%
+    group_by(adm_year) %>%
+    summarise(., Total = (sum(Emerg_readm_surg)/sum(Admissions))*100)%>%
+ggplot(aes(cardiacsurgery, x = adm_year, y =Total)) + 
+  geom_line(color = "#2c2825", size=0.8) +
+  geom_point(color = "#2c2825", size=2) +  
+  labs(title="Emergency readmissions within 30 days", y = "% Readmissions", x="")+
+  theme_bw()+
+  theme(panel.grid.major.y = element_line(color = "grey80"), panel.grid.major.x =  element_blank(), panel.grid.minor.x =  element_blank(), panel.border = element_blank(), axis.line = element_line(colour = "black", size=1),
+        axis.text.x = element_text(size = 12), axis.text.y = element_text(size = 12), 
+        axis.title.x = element_blank(), axis.title.y = element_text(size = 13.5,vjust=2))+          
+ scale_y_continuous(expand = c(0, 0), limits=c(0,1.2, 20))
+   
+    
+ 
+    
+```
+
+
+
+
+# Total Length of Stay
+
+## Total Episode Length of Stay
+
+```{r, echo=FALSE, fig.height=4, fig.width=7}
+
+#Total LOS between April 2012 to April 2022
+ cardiacsurgery_tsb %>%
+ summarise(TotalLOS = sum(epi_los))%>%
+  ggplot(aes(x = Month, y =TotalLOS)) + 
+  geom_line(color = "#2c2825", size=1) +
+   geom_smooth(method=lm, se=FALSE, col="#9d928a", linetype="dashed", size=1)+
+  labs( title = "Total episode length of stay",y = "Length of Stay (days)", x="")+
+  theme_bw()+
+  theme(panel.grid.major.y = element_line(color = "grey80"), panel.grid.major.x =  element_blank(), panel.grid.minor.x =  element_blank(), panel.border = element_blank(), axis.line = element_line(colour = "black", size=1),
+        axis.text.x = element_text(size = 12), axis.text.y = element_text(size = 12), 
+        axis.title.x = element_text(size = 14), axis.title.y = element_text(size = 14,vjust=2), 
+        legend.text=element_text(size=12),legend.title=element_blank(),plot.title = element_text(size=14), legend.position= c(0.85, 0.8)) +
+       scale_y_continuous(expand = c(0, 0), limits=c(0,8000, 200)) 
+
+```
+
+## Elective vs non-elective LOS
+
+```{r, echo=FALSE, fig.height=4, fig.width=7}
+
+#Total LOS between April 2012 to April 2022
+cardiacsurgery_tsb %>%
+  group_by(Admit_Method)%>%
+summarise(TotalLOS = sum(epi_los)) %>%  
+ggplot(aes(x = Month, y =TotalLOS, group=Admit_Method)) + 
+  geom_line(aes(color=Admit_Method), size=1) +
+  geom_smooth( se=FALSE, col="#9d928a", linetype="dashed", size=1)+
+  labs( title = "Elective vs Non-elective total episode length of stay",y = "Length of Stay (days)", x="")+
+  theme_bw()+
+  theme(panel.grid.major.y = element_line(color = "grey80"), panel.grid.major.x =  element_blank(), panel.grid.minor.x =  element_blank(), panel.border = element_blank(), axis.line = element_line(colour = "black", size=1),
+        axis.text.x = element_text(size = 12), axis.text.y = element_text(size = 12), 
+        axis.title.x = element_text(size = 14), axis.title.y = element_text(size = 14,vjust=2), 
+        legend.text=element_text(size=12),legend.title=element_blank(),plot.title = element_text(size=14),legend.position= c(0.15, 0.2)) +           scale_y_continuous(expand = c(0, 0), limits=c(0,5000, 5000)) +          
+  scale_color_manual(values=c("#2c2825", "#ec6555"))
+        
+```
+
+## Critical Care LOS 
+
+```{r, echo=FALSE, fig.height=4, fig.width=7}
+
+#Total LOS between April 2012 to April 2022
+cardiacsurgery_tsb %>%
+summarise(TotalLOS = sum(TotalCC_los)) %>%  
+ggplot(aes(x = Month, y =TotalLOS)) + 
+  geom_line(size=1) +
+  labs( title = "Critical Care total LOS",y = "Length of Stay (days)", x="")+
+  theme_bw()+
+  theme(panel.grid.major.y = element_line(color = "grey80"), panel.grid.major.x =  element_blank(), panel.grid.minor.x =  element_blank(), panel.border = element_blank(), axis.line = element_line(colour = "black", size=1),
+        axis.text.x = element_text(size = 12), axis.text.y = element_text(size = 12), 
+        axis.title.x = element_text(size = 14), axis.title.y = element_text(size = 14,vjust=2), 
+        legend.text=element_text(size=12),legend.title=element_blank(),plot.title = element_text(size=14),legend.position= c(0.15, 0.2)) +           scale_y_continuous(expand = c(0, 0), limits=c(0,2200, 5000)) +          
+  scale_color_manual(values=c("#2c2825", "red"))
+        
+```
+
+
+
+## Critical Care LOS Elective vs non-elective 
+
+```{r, echo=FALSE, fig.height=4, fig.width=7}
+
+#Total LOS between April 2012 to April 2022
+cardiacsurgery_tsb %>%
+  group_by(Admit_Method)%>%
+summarise(TotalLOS = sum(TotalCC_los)) %>%  
+ggplot(aes(x = Month, y =TotalLOS, group=Admit_Method)) + 
+  geom_line(aes(color=Admit_Method), size=1) +
+  labs( title = "Critical Care total LOS",y = "Length of Stay (days)", x="")+
+  theme_bw()+
+  theme(panel.grid.major.y = element_line(color = "grey80"), panel.grid.major.x =  element_blank(), panel.grid.minor.x =  element_blank(), panel.border = element_blank(), axis.line = element_line(colour = "black", size=1),
+        axis.text.x = element_text(size = 12), axis.text.y = element_text(size = 12), 
+        axis.title.x = element_text(size = 14), axis.title.y = element_text(size = 14,vjust=2), 
+        legend.text=element_text(size=12),legend.title=element_blank(),plot.title = element_text(size=14),legend.position= c(0.15, 0.2)) +           scale_y_continuous(expand = c(0, 0), limits=c(0,1300, 5000)) +          
+  scale_color_manual(values=c("#2c2825", "#ec6555"))
+        
+```
+
+# Average Length of Stay
+
+## Average Episode Length of Stay
+
+```{r, echo=FALSE, fig.height=4, fig.width=7}
+
+#Total LOS between April 2012 to April 2022
+ cardiacsurgery_tsb %>%
+ summarise(Average = (sum(epi_los)/sum(Episodes)))%>%
+  ggplot(aes(x = Month, y =Average)) + 
+  geom_line(color = "#2c2825", size=1) +
+   geom_smooth(method=lm, se=FALSE, col="#9d928a", linetype="dashed", size=1)+
+  labs( title = "Average episode length of stay",y = "Length of Stay (days)", x="")+
+  theme_bw()+
+  theme(panel.grid.major.y = element_line(color = "grey80"), panel.grid.major.x =  element_blank(), panel.grid.minor.x =  element_blank(), panel.border = element_blank(), axis.line = element_line(colour = "black", size=1),
+        axis.text.x = element_text(size = 12), axis.text.y = element_text(size = 12), 
+        axis.title.x = element_text(size = 14), axis.title.y = element_text(size = 14,vjust=2), 
+        legend.text=element_text(size=12),legend.title=element_blank(),plot.title = element_text(size=14), legend.position= c(0.85, 0.8)) +
+       scale_y_continuous(expand = c(0, 0), limits=c(0,7, 200)) 
+
+```
+
+## Elective vs non-elective LOS
+
+```{r, echo=FALSE, fig.height=4, fig.width=7}
+
+#Average elective LOS between April 2012 to April 2022
+cardiacsurgery_tsb %>%
+  group_by(Admit_Method)%>%
+summarise(Average = (sum(epi_los)/sum(Episodes))) %>% 
+  filter(Admit_Method=="Elective") %>%
+ggplot(aes(x = Month, y =Average, group=Admit_Method)) + 
+  geom_line(aes(color=Admit_Method), size=1) +
+  geom_smooth(method=lm, se=FALSE, col="#9d928a", linetype="dashed", size=1)+
+  labs( title = "Elective average length of stay",y = "Length of Stay (days)", x="")+
+  theme_bw()+
+  theme(panel.grid.major.y = element_line(color = "grey80"), panel.grid.major.x =  element_blank(), panel.grid.minor.x =  element_blank(), panel.border = element_blank(), axis.line = element_line(colour = "black", size=1),
+        axis.text.x = element_text(size = 12), axis.text.y = element_text(size = 12), 
+        axis.title.x = element_text(size = 14), axis.title.y = element_text(size = 14,vjust=2),
+        legend.position="none", plot.title = element_text(size=14)) +           
+  scale_y_continuous(expand = c(0, 0), limits=c(0,8, 50)) +          
+  scale_color_manual(values=c("#2c2825"))
+
+
+
+
+#Average non-elective LOS between April 2012 to April 2022
+cardiacsurgery_tsb %>%
+  group_by(Admit_Method)%>%
+summarise(Average = (sum(epi_los)/sum(Episodes))) %>% 
+  filter(Admit_Method=="Non-elective") %>%
+ggplot(aes(x = Month, y =Average, group=Admit_Method)) + 
+  geom_line(aes(color=Admit_Method), size=1) +
+  geom_smooth(method=lm, se=FALSE, col="#9d928a", linetype="dashed", size=1)+
+  labs( title = "Non-elective average length of stay",y = "Length of Stay (days)", x="")+
+  theme_bw()+
+  theme(panel.grid.major.y = element_line(color = "grey80"), panel.grid.major.x =  element_blank(), panel.grid.minor.x =  element_blank(), panel.border = element_blank(), axis.line = element_line(colour = "black", size=1),
+        axis.text.x = element_text(size = 12), axis.text.y = element_text(size = 12), 
+        axis.title.x = element_text(size = 14), axis.title.y = element_text(size = 14,vjust=2),
+        legend.position="none", plot.title = element_text(size=14)) +           
+  scale_y_continuous(expand = c(0, 0), limits=c(0,8, 50)) +          
+  scale_color_manual(values=c("#ec6555"))
+
+        
+```
+
+
+
+# Functions
+
+
+```{r}
+# Functions
+
+#Checking seasonality
+Seasonality<-function(dataset, col_name) {
+  col_name <- enquo(col_name)
+  
+  # Checking seasonality
+  a<-dataset %>%
+  gg_season()
+  
+  #Need for seasonal differencing
+  b<-dataset %>%
+    unitroot_nsdiffs()
+  
+  # Time Series Decomposition
+   c<-dataset %>%
+   model(STL()) %>%
+    components() %>%
+     autoplot()
+
+  print(a) 
+  print(b)
+ print(c)
+
+}
+
+
+#Forecasting without transform
+Forecast_no_transform<-function(dataset, id_title, Label) {
+  
+   #Fit model
+   m <- prophet( holidays=Lockdowns, changepoint.prior.scale = 0.1, interval.width = 0.95 )
+   #m<-add_country_holidays(m, country_name = 'GB')
+   m<-fit.prophet(m, dataset) 
+   #m$train.holiday.names
+  
+  # Forecast
+  future <- make_future_dataframe(m, periods = 60, freq = 'month' )
+  forecast <- predict(m, future)
+
+  a<-plot(m, forecast) +add_changepoints_to_plot(m)
+  #prophet_plot_components(m, forecast)
+  
+  forecast<-left_join(forecast, dataset, by="ds")
+  forecast$ds<-as.Date(as.character(forecast$ds), format="%Y-%m-%d")
+  
+  # view residuals
+ forecast$residuals<-forecast$Total - forecast$yhat
+  b<-plot(forecast$residuals, type="l")
+  
+  #Format data for plotting
+  forecast2<-forecast
+  forecast2$yhat<-ifelse(!is.na(forecast2$Total), NA, forecast2$yhat)
+  forecast2$yhat_lower<-ifelse(!is.na(forecast2$Total), NA, forecast2$yhat_lower)
+  forecast2$yhat_upper<-ifelse(!is.na(forecast2$Total), NA, forecast2$yhat_upper)
+  
+   c<-ggplot() + 
+    geom_line(forecast2, mapping=aes(x = ds, y= yhat), color="#5881c1", size=1) +
+  geom_ribbon(forecast2,mapping= aes(x= ds, ymin = yhat_lower, ymax = yhat_upper), fill="#5881c1", alpha = 0.3) +
+  labs( title = id_title ,y = Label, x="")+
+  theme_bw()+
+  theme(panel.grid.major.y = element_line(color = "grey80"), panel.grid.major.x =  element_blank(), panel.grid.minor.x =  element_blank(), panel.border = element_blank(), axis.line = element_line(colour = "black", size=1),
+        axis.text.x = element_text(size = 12), axis.text.y = element_text(size = 12), 
+        axis.title.x = element_text(size = 14), axis.title.y = element_text(size = 14,vjust=2), 
+        legend.text=element_text(size=12),legend.title=element_blank(),plot.title = element_text(size=14),legend.position= c(0.15, 0.8))+ 
+     expand_limits(y=0)+
+  geom_line(forecast, mapping=aes(x= ds, y=Total), color="#2c2825", size=1)+ 
+      scale_x_date(date_breaks = "3 years", date_labels = "%b-%Y")
+   
+   #Cross validation
+  df.cv <- cross_validation(m, horizon = (1461/48)*12, units = "days", period = (1461/48)*6, initial = (1461/48) * 36)
+
+  df.p <- performance_metrics(df.cv)
+  d<-plot_cross_validation_metric(df.cv,metric = 'mape')
+  meanMAPE<-data.frame(mean(df.p$mape))
+
+  
+    print(a) 
+    print(b)
+      print(c)
+       print(d)
+ 
+               
+  #Data for table
+  ds<-forecast$ds
+  predicted<-forecast$yhat
+  yhat_lower<-forecast$yhat_lower
+  yhat_upper<-forecast$yhat_upper
+  actual<-forecast$Total
+  group<-id_title
+
+Table<-data.frame(ds, predicted, yhat_lower, yhat_upper, actual, group) 
+
+      
+  return(list(meanMAPE, Table))   
+
+    
+  
+}
+
+
+ 
+
+
+
+
+#Forecasting with log transform
+Forecast_log_transform<-function(dataset, id_title, Label) {
+  
+  #log transform
+  dataset$y =log(dataset$y)
+  
+   #Fit model
+   m <- prophet( holidays=Lockdowns, changepoint.prior.scale = 0.1, interval.width = 0.95 )
+   #m<-add_country_holidays(m, country_name = 'GB')
+   m<-fit.prophet(m, dataset) 
+   #m$train.holiday.names
+  
+  # Forecast
+  future <- make_future_dataframe(m, periods = 60, freq = 'month' )
+  forecast <- predict(m, future)
+
+  a<-plot(m, forecast) +add_changepoints_to_plot(m)
+  #prophet_plot_components(m, forecast)
+  
+  inverse_forecast <- forecast
+  inverse_forecast[c('yhat','yhat_lower', 'yhat_upper')] <- exp(inverse_forecast[c('yhat','yhat_lower', 'yhat_upper')])
+
+  inverse_forecast<-left_join(inverse_forecast, dataset, by="ds")
+  inverse_forecast$ds<-as.Date(as.character(inverse_forecast$ds), format="%Y-%m-%d")
+  
+  # view residuals
+  inverse_forecast$residuals<-inverse_forecast$Total - inverse_forecast$yhat
+  b<-plot(inverse_forecast$residuals, type="l")
+  
+  #Format data for plotting
+  inverse_forecast2<-inverse_forecast
+  inverse_forecast2$yhat<-ifelse(!is.na(inverse_forecast2$Total), NA, inverse_forecast2$yhat)
+  inverse_forecast2$yhat_lower<-ifelse(!is.na(inverse_forecast2$Total), NA, inverse_forecast2$yhat_lower)
+  inverse_forecast2$yhat_upper<-ifelse(!is.na(inverse_forecast2$Total), NA, inverse_forecast2$yhat_upper)
+  
+   c<-ggplot() + 
+    geom_line(inverse_forecast2, mapping=aes(x = ds, y= yhat), color="#5881c1", size=1) +
+  geom_ribbon(inverse_forecast2,mapping= aes(x= ds, ymin = yhat_lower, ymax = yhat_upper), fill="#5881c1", alpha = 0.3) +
+  labs( title = id_title ,y = Label, x="")+
+  theme_bw()+
+  theme(panel.grid.major.y = element_line(color = "grey80"), panel.grid.major.x =  element_blank(), panel.grid.minor.x =  element_blank(), panel.border = element_blank(), axis.line = element_line(colour = "black", size=1),
+        axis.text.x = element_text(size = 12), axis.text.y = element_text(size = 12), 
+        axis.title.x = element_text(size = 14), axis.title.y = element_text(size = 14,vjust=2), 
+        legend.text=element_text(size=12),legend.title=element_blank(),plot.title = element_text(size=14),legend.position= c(0.15, 0.8))+ 
+     expand_limits(y=0)+
+  geom_line(inverse_forecast, mapping=aes(x= ds, y=Total), color="#2c2825", size=1)+ 
+      scale_x_date(date_breaks = "3 years", date_labels = "%b-%Y")
+   
+   
+  #Cross validation
+  df.cv <- cross_validation(m, horizon = (1461/48)*12, units = "days", period = (1461/48)*6, initial = (1461/48) * 36)
+  df.cv[c('y','yhat')] <- exp(df.cv [c('y','yhat')])
+
+  df.p <- performance_metrics(df.cv)
+  d<-plot_cross_validation_metric(df.cv,metric = 'mape')
+  meanMAPE<-data.frame(mean(df.p$mape))
+
+  print(a) 
+    print(b)
+      print(c)
+      print(d)
+      
+  #Data for table
+  ds<-inverse_forecast$ds
+  forecast<-inverse_forecast$yhat
+  yhat_lower<-inverse_forecast$yhat_lower
+  yhat_upper<-inverse_forecast$yhat_upper
+  actual<-inverse_forecast$Total
+  group<-id_title
+
+Table<-data.frame(ds, forecast, yhat_lower, yhat_upper, actual, group) 
+
+return(list(meanMAPE, Table))
+      
+      
+}
+
+
+#Forecasting with boxcox transform
+Forecast_boxcox_transform<-function(dataset, id_title, Label) {
+  
+  #boxcox transform
+  lam <- BoxCox.lambda(dataset$y, method = "guerrero")
+  dataset$y <- BoxCox(dataset$y, lam )
+  
+  #Fit model
+   m <- prophet( holidays=Lockdowns, changepoint.prior.scale = 0.1, interval.width = 0.95 )
+   #m<-add_country_holidays(m, country_name = 'GB')
+   m<-fit.prophet(m, dataset) 
+   #m$train.holiday.names
+  
+  # Forecast
+  future <- make_future_dataframe(m, periods = 60, freq = 'month' )
+  forecast <- predict(m, future)
+
+  a<-plot(m, forecast) +add_changepoints_to_plot(m)
+  #prophet_plot_components(m, forecast)
+  
+  inverse_forecast <- forecast
+  inverse_forecast[c('yhat','yhat_lower', 'yhat_upper')] <- InvBoxCox(inverse_forecast[c('yhat','yhat_lower', 'yhat_upper')], lam)
+  
+   inverse_forecast<-left_join(inverse_forecast, dataset, by="ds")
+  inverse_forecast$ds<-as.Date(as.character(inverse_forecast$ds), format="%Y-%m-%d")
+  
+  # view residuals
+  inverse_forecast$residuals<-inverse_forecast$Total - inverse_forecast$yhat
+  b<-plot(inverse_forecast$residuals, type="l")
+  
+  #Format data for plotting
+  inverse_forecast2<-inverse_forecast
+  inverse_forecast2$yhat<-ifelse(!is.na(inverse_forecast2$Total), NA, inverse_forecast2$yhat)
+  inverse_forecast2$yhat_lower<-ifelse(!is.na(inverse_forecast2$Total), NA, inverse_forecast2$yhat_lower)
+  inverse_forecast2$yhat_upper<-ifelse(!is.na(inverse_forecast2$Total), NA, inverse_forecast2$yhat_upper)
+  
+   c<-ggplot() + 
+    geom_line(inverse_forecast2, mapping=aes(x = ds, y= yhat), color="#5881c1", size=1) +
+  geom_ribbon(inverse_forecast2,mapping= aes(x= ds, ymin = yhat_lower, ymax = yhat_upper), fill="#5881c1", alpha = 0.3) +
+  labs( title = id_title ,y = Label, x="")+
+  theme_bw()+
+  theme(panel.grid.major.y = element_line(color = "grey80"), panel.grid.major.x =  element_blank(), panel.grid.minor.x =  element_blank(), panel.border = element_blank(), axis.line = element_line(colour = "black", size=1),
+        axis.text.x = element_text(size = 12), axis.text.y = element_text(size = 12), 
+        axis.title.x = element_text(size = 14), axis.title.y = element_text(size = 14,vjust=2), 
+        legend.text=element_text(size=12),legend.title=element_blank(),plot.title = element_text(size=14),legend.position= c(0.15, 0.8))+ 
+      expand_limits(y=0)+
+  geom_line(inverse_forecast, mapping=aes(x= ds, y=Total), color="#2c2825", size=1)+ 
+      scale_x_date(date_breaks = "3 years", date_labels = "%b-%Y")
+   
+ #Cross validation
+  df.cv <- cross_validation(m, horizon = (1461/48)*12, units = "days", period = (1461/48)*6, initial = (1461/48) * 36)
+  df.cv[c('y','yhat')] <- InvBoxCox(df.cv [c('y','yhat')], lam)
+
+  df.p <- performance_metrics(df.cv)
+  d<-plot_cross_validation_metric(df.cv,metric = 'mape')
+  meanMAPE<-data.frame(mean(df.p$mape))
+
+  print(a) 
+    print(b)
+      print(c)
+      print(d)  
+      
+       #Data for table
+  ds<-inverse_forecast$ds
+  forecast<-inverse_forecast$yhat
+  yhat_lower<-inverse_forecast$yhat_lower
+  yhat_upper<-inverse_forecast$yhat_upper
+  actual<-inverse_forecast$Total
+  group<-id_title
+
+Table<-data.frame(ds, forecast, yhat_lower, yhat_upper, actual, group) 
+
+return(list(meanMAPE, Table))
+      
+}
+
+
+
+
+```
+
+Prophet uses an additive model where linear trends are fit with yearly, weekly, and daily seasonality, plus holiday effects. It works best with time series that have strong seasonal effects and several seasons of historical data. Prophet is robust to missing data and shifts in the trend, and typically handles outliers well.
+
+# Forecasting using the prophets package
+
+## Elective admissions
+Need to log to prevent negative values
+```{r, echo=FALSE, fig.height=4, fig.width=7}
+
+ElectiveAdmissions_tsb<-cardiacsurgery_tsb %>%
+  filter(., Admit_Method=="Elective") %>%
+summarise(Total = sum(Admissions))
+
+#Seasonality check
+Seasonality(ElectiveAdmissions_tsb, "Total")  
+
+#Elective admissions
+ElectiveAdmissions <-filter(cardiacsurgery, Admit_Method=="Elective") %>%
+  group_by(Date)%>%
+   summarise(., Total = sum(Admissions))  %>%
+  mutate (., ds = Date, y = Total) 
+
+Elec_Admit<-ElectiveAdmissions #To use as a regressor in LOS forecast
+
+
+ElectiveAdmissions<- Forecast_log_transform(ElectiveAdmissions, "Elective Admissions", "Number")
+
+MAPE_Elec_Admissions <- ElectiveAdmissions[[1]]
+Table_Elec_Admissions<- ElectiveAdmissions[[2]]
+
+
+ElectiveAdmissionsForecast<-Table_Elec_Admissions%>%
+  mutate (.,forecast= ifelse(is.na(actual), forecast, actual ))
+
+```
+
+## Non-Elective admissions
+
+```{r, echo=FALSE, fig.height=4, fig.width=7}
+
+NonElectiveAdmit<-cardiacsurgery_tsb %>%
+  filter(., Admit_Method=="Non-elective") %>%
+summarise(Total= sum(Admissions)) 
+
+#Seasonality check
+Seasonality(NonElectiveAdmit, "Total")  
+
+
+#Non-elective admissions
+NonElectiveAdmissions <-filter(cardiacsurgery, Admit_Method=="Non-elective") %>%
+  group_by(Date)%>%
+   summarise(., Total = sum(Admissions))  %>%
+  mutate (., ds = Date, y = Total) 
+
+NonElectiveAdmissions<- Forecast_boxcox_transform(NonElectiveAdmissions, "Non-Elective Admissions", "Number")
+
+MAPE_NonElec_Admissions <- NonElectiveAdmissions[[1]]
+Table_NonElec_Admissions<- NonElectiveAdmissions[[2]]
+
+
+```
+
+## Total Admissions (both elective and non-elective)
+
+```{r, echo=FALSE, fig.height=4, fig.width=7}
+
+TotalAdmit<-cardiacsurgery_tsb %>%
+summarise(Total= sum(Admissions)) 
+
+#Seasonality check
+Seasonality(TotalAdmit, "Total")  
+
+
+#All admissions
+Admissions<-cardiacsurgery %>%
+  group_by(Date)%>%
+   summarise(., Total = sum(Admissions)) %>%
+  mutate (., ds = Date, y = Total)
+
+Admissions<- Forecast_boxcox_transform(Admissions, "Total Admissions", "Number")
+
+MAPE_Admissions <- Admissions[[1]]
+Table_Admissions<- Admissions[[2]]
+
+
+```
+
+## Elective LOS
+
+```{r, echo=FALSE, fig.height=4, fig.width=7}
+
+ElectiveLOS<-cardiacsurgery_tsb %>%
+  filter(., Admit_Method=="Elective") %>%
+summarise(Total= sum(epi_los)) 
+
+#Seasonality check
+Seasonality(ElectiveLOS, "Total")  
+
+
+#Elective LOS
+LOS_elective <-filter(cardiacsurgery, Admit_Method=="Elective") %>%
+  group_by(Date)%>%
+   summarise(., Total = sum(epi_los)) %>%
+    mutate (., ds = Date, y = Total) 
+
+LOS_elective <- column_to_rownames(LOS_elective, var = "Date" ) #Set Date as index column
+
+# Log transform to ensure values remain positive
+LOS_elective$y = log(LOS_elective$y)
+
+LOS_elective$Admissions<-Elec_Admit$Total
+m <- (prophet(holidays=Lockdowns, changepoint.prior.scale = 0.1, interval.width = 0.95  ))
+#m<-add_country_holidays(m, country_name = 'GB')
+m <- add_regressor(m, 'Admissions')
+m<-fit.prophet(m, LOS_elective) 
+
+future <- make_future_dataframe(m, periods = 60, freq = 'month' )
+future$Admissions <- Table_Elec_Admissions$forecast
+forecast <- predict(m, future)
+
+
+plot(m, forecast) + add_changepoints_to_plot(m)
+
+#prophet_plot_components(m, forecast)
+
+inverse_forecast <- forecast
+inverse_forecast <- column_to_rownames(inverse_forecast, var = "ds")
+inverse_forecast <-  exp(inverse_forecast)
+inverse_forecast <- rownames_to_column(inverse_forecast, var = "ds")
+inverse_forecast$ds <-as.POSIXct(inverse_forecast$ds,format="%Y-%m-%d")
+
+inverse_forecast<-left_join(inverse_forecast, LOS_elective, by="ds")
+inverse_forecast$ds<-as.Date(as.character(inverse_forecast$ds), format="%Y-%m-%d")
+# view residuals
+inverse_forecast$residuals<-inverse_forecast$Total - inverse_forecast$yhat
+plot(inverse_forecast$residuals, type="l")
+
+inverse_forecast2<-inverse_forecast
+inverse_forecast2$yhat<-ifelse(!is.na(inverse_forecast2$Total), NA, inverse_forecast2$yhat)
+inverse_forecast2$yhat_lower<-ifelse(!is.na(inverse_forecast2$Total), NA, inverse_forecast2$yhat_lower)
+inverse_forecast2$yhat_upper<-ifelse(!is.na(inverse_forecast2$Total), NA, inverse_forecast2$yhat_upper)
+
+ggplot() + 
+    geom_line(inverse_forecast2, mapping=aes(x = ds, y= yhat), color="#5881c1", size=1) +
+  geom_ribbon(inverse_forecast2,mapping= aes(x= ds, ymin = yhat_lower, ymax = yhat_upper), fill= "#5881c1", alpha = 0.3) +
+  labs( title = "Elective LOS",y = "Days", x="")+
+  theme_bw()+
+  theme(panel.grid.major.y = element_line(color = "grey80"), panel.grid.major.x =  element_blank(), panel.grid.minor.x =  element_blank(), panel.border = element_blank(), axis.line = element_line(colour = "black", size=1),
+        axis.text.x = element_text(size = 12), axis.text.y = element_text(size = 12), 
+        axis.title.x = element_text(size = 14), axis.title.y = element_text(size = 14,vjust=2), 
+        legend.text=element_text(size=12),legend.title=element_blank(),plot.title = element_text(size=14), legend.position= c(0.15, 0.8)) +
+       expand_limits(y=0)+
+  geom_line(inverse_forecast, mapping=aes(x= ds, y=Total), color="#2c2825", size=1)+ 
+      scale_x_date(date_breaks = "3 years", date_labels = "%b-%Y")
+
+
+
+#Cross validation (horizon 12 month, step 6 months, initial 36 months)
+df.cv <- cross_validation(m, horizon = (1461/48)*12, units = "days", period = (1461/48)*6, initial = (1461/48) * 36)
+df.cv$y <- exp(df.cv$y)
+df.cv$yhat <- exp(df.cv$yhat)
+df.cv$yhat_lower <- exp(df.cv$yhat_lower)
+df.cv$yhat_upper <- exp(df.cv$yhat_upper)
+
+
+df.p <- performance_metrics(df.cv)
+plot_cross_validation_metric(df.cv,metric = 'mape',rolling_window=0.3)
+
+LOSElecmeanMAPE<-mean(df.p$mape)
+mean(df.p$mape)
+
+#Data for table
+ds<-inverse_forecast$ds
+forecast<-inverse_forecast$yhat
+yhat_lower<-inverse_forecast$yhat_lower
+yhat_upper<-inverse_forecast$yhat_upper
+actual<-inverse_forecast$Total
+group<-"Elective LOS"
+
+Table_LOS_Elective<-data.frame(ds, forecast, yhat_lower, yhat_upper, actual, group)
+
+```
+
+## Non-Elective LOS
+
+```{r, echo=FALSE, fig.height=4, fig.width=7}
+
+NonElectiveLOS<-cardiacsurgery_tsb %>%
+  filter(., Admit_Method=="Non-elective") %>%
+summarise(Total= sum(epi_los)) 
+
+#Seasonality check
+Seasonality(NonElectiveLOS, "Total")  
+
+
+#Non-Elective admissions
+LOS_non_elective <-filter(cardiacsurgery, Admit_Method=="Non-elective") %>%
+  group_by(Date)%>%
+   summarise(., Total = sum(epi_los)) %>%
+mutate (., ds = Date, y = Total) 
+
+LOS_non_elective<- Forecast_boxcox_transform(LOS_non_elective, "Non-Elective LOS", "Days")
+
+MAPE_LOS_non_elective <- LOS_non_elective[[1]]
+Table_LOS_non_elective<- LOS_non_elective[[2]]
+
+```
+
+## Total LOS
+
+```{r, echo=FALSE, fig.height=4, fig.width=7}
+
+LOS_Total<-cardiacsurgery_tsb %>%
+summarise(Total= sum(epi_los)) 
+
+#Seasonality check
+Seasonality(LOS_Total, "Total")  
+
+
+#Non-Elective admissions
+LOS_Total <-cardiacsurgery%>%
+  group_by(Date)%>%
+   summarise(., Total = sum(epi_los)) %>%
+mutate (., ds = Date, y = Total) 
+
+LOS_Total<- Forecast_boxcox_transform(LOS_Total, "Total LOS", "Days")
+
+MAPE_LOS_Total <- LOS_Total[[1]]
+Table_LOS_Total<- LOS_Total[[2]]
+
+```
+
+
+## Average elective LOS
+
+```{r, echo=FALSE, fig.height=4, fig.width=7}
+
+AverageElectiveLOS<-cardiacsurgery_tsb %>%
+  filter(., Admit_Method=="Elective") %>%
+summarise(MeanLOS = (sum(epi_los)/sum(Episodes))) 
+
+#Seasonality check
+Seasonality(AverageElectiveLOS, "MeanLOS")  
+
+#Elective Mean LOS
+MeanLOS_elective <-filter(cardiacsurgery, Admit_Method=="Elective") %>%
+  group_by(Date)%>%
+   summarise(., Total = (sum(epi_los)/sum(Episodes))) %>%
+ mutate (., ds = Date, y = Total) 
+
+
+MeanLOS_elective<- Forecast_boxcox_transform(MeanLOS_elective, "Mean Elective LOS", "Days")
+
+MAPE_Elec_MeanLOS <- MeanLOS_elective[[1]]
+Table_Elec_MeanLOS<- MeanLOS_elective[[2]]
+
+
+```
+
+## Average Non-Elective LOS
+
+```{r, echo=FALSE, fig.height=4, fig.width=7}
+
+
+AverageNonElectiveLOS<-cardiacsurgery_tsb %>%
+  filter(., Admit_Method=="Non-elective") %>%
+summarise(MeanLOS = (sum(epi_los)/sum(Episodes))) 
+
+#Seasonality check
+Seasonality(AverageNonElectiveLOS, "MeanLOS")  
+
+
+#Non Elective mean LOS
+MeanLOS_non_elective <-filter(cardiacsurgery, Admit_Method=="Non-elective") %>%
+  group_by(Date)%>%
+   summarise(., Total = (sum(epi_los)/sum(Episodes)))  %>%
+ mutate (., ds = Date, y = Total) 
+
+
+MeanLOS_non_elective<- Forecast_boxcox_transform(MeanLOS_non_elective, "Mean Non-Elective LOS", "Days")
+
+MAPE_MeanLOS_non_elective <- MeanLOS_non_elective[[1]]
+Table_MeanLOS_non_elective<- MeanLOS_non_elective[[2]]
+
+
+```
+
+## Average LOS (elective and non-elective)
+
+```{r, echo=FALSE, fig.height=4, fig.width=7}
+
+AverageLOS<-cardiacsurgery_tsb %>%
+summarise(MeanLOS = (sum(epi_los)/sum(Episodes))) 
+
+#Seasonality check
+Seasonality(AverageLOS, "MeanLOS")  
+
+
+#Mean LOS
+MeanLOS <-cardiacsurgery%>%
+  group_by(Date)%>%
+   summarise(., Total = (sum(epi_los)/sum(Episodes)))  %>%
+ mutate (., ds = Date, y = Total) 
+
+MeanLOS<- Forecast_boxcox_transform(MeanLOS, "Mean Total LOS", "Days")
+
+MAPE_MeanLOS <- MeanLOS[[1]]
+Table_MeanLOS<- MeanLOS[[2]]
+
+```
+
+# By provider forecasts
+
+
+```{r, echo=FALSE, fig.height=8, fig.width=12}
+
+
+```
+
+
+
+
+
+## RJE University Hospitals of North Midlands  Total Admissions (both elective and non-elective)
+
+```{r, echo=FALSE, fig.height=4, fig.width=7}
+
+RJE_tsb<-cardiacsurgery_tsb %>%
+  filter(Der_Provider_Code=="RJE") %>%
+summarise(Total = sum(Admissions)) 
+
+#Seasonality check
+Seasonality(RJE_tsb, "Total")  
+
+
+#All admissions
+RJE<-cardiacsurgery %>%
+    filter(Der_Provider_Code=="RJE") %>%
+  group_by(Date)%>%
+   summarise(., Total = sum(Admissions)) %>%
+ mutate (., ds = Date, y = Total) 
+
+
+RJE<- Forecast_boxcox_transform(RJE, "University Hospitals of North Midlands", "Number")
+
+MAPE_RJE <- RJE[[1]]
+Table_RJE<- RJE[[2]]
+
+
+```
+
+## RKB University Hospitals Coventry & Warwickshire Total Admissions (both elective and non-elective)
+
+```{r, echo=FALSE, fig.height=4, fig.width=7}
+
+RKB_tsb<-cardiacsurgery_tsb %>%
+  filter(Der_Provider_Code=="RKB") %>%
+summarise(Total = sum(Admissions)) 
+
+#Seasonality check
+Seasonality(RKB_tsb, "Total")  
+
+
+#All admissions
+RKB<-cardiacsurgery %>%
+    filter(Der_Provider_Code=="RKB") %>%
+  group_by(Date)%>%
+   summarise(., Total = sum(Admissions)) %>%
+ mutate (., ds = Date, y = Total) 
+
+
+RKB<- Forecast_boxcox_transform(RKB, "University Hospitals Coventry & Warwickshire", "Number")
+
+MAPE_RKB <- RKB[[1]]
+Table_RKB<- RKB[[2]]
+
+```
+
+## RL4 The Royal Wolverhampton Total Admissions (both elective and non-elective)
+
+```{r, echo=FALSE, fig.height=4, fig.width=7}
+
+RL4_tsb<-cardiacsurgery_tsb %>%
+  filter(Der_Provider_Code=="RL4") %>%
+summarise(Total = sum(Admissions)) 
+
+#Seasonality check
+Seasonality(RL4_tsb, "Total")  
+
+
+#All admissions
+RL4<-cardiacsurgery %>%
+    filter(Der_Provider_Code=="RL4") %>%
+  group_by(Date)%>%
+   summarise(., Total = sum(Admissions)) %>%
+ mutate (., ds = Date, y = Total) 
+
+
+
+RL4<- Forecast_boxcox_transform(RL4, "The Royal Wolverhampton", "Number")
+
+MAPE_RL4 <- RL4[[1]]
+Table_RL4<- RL4[[2]]
+
+```
+## RRK University Hospitals Birmingham  Total Admissions (both elective and non-elective)
+
+```{r, echo=FALSE, fig.height=4, fig.width=7}
+
+RRK_tsb<-cardiacsurgery_tsb %>%
+  filter(Der_Provider_Code=="RRK") %>%
+summarise(Total = sum(Admissions)) 
+
+#Seasonality check
+Seasonality(RRK_tsb, "Total")  
+
+
+#All admissions
+RRK<-cardiacsurgery %>%
+    filter(Der_Provider_Code=="RRK") %>%
+  group_by(Date)%>%
+   summarise(., Total = sum(Admissions)) %>%
+ mutate (., ds = Date, y = Total) 
+
+RRK<- Forecast_boxcox_transform(RRK, "University Hospitals Birmingham", "Number")
+
+MAPE_RRK <- RRK[[1]]
+Table_RRK<- RRK[[2]]
+
+```
+
+
+## RWE University Hospitals of Leicester Total Admissions (both elective and non-elective)
+
+```{r, echo=FALSE, fig.height=4, fig.width=7}
+
+RWE_tsb<-cardiacsurgery_tsb %>%
+  filter(Der_Provider_Code=="RWE") %>%
+summarise(Total = sum(Admissions)) 
+
+#Seasonality check
+Seasonality(RWE_tsb, "Total")  
+
+
+#All admissions
+RWE<-cardiacsurgery %>%
+    filter(Der_Provider_Code=="RWE") %>%
+  group_by(Date)%>%
+   summarise(., Total = sum(Admissions)) %>%
+ mutate (., ds = Date, y = Total) 
+
+RWE<- Forecast_boxcox_transform(RWE, "University Hospitals of Leicester", "Number")
+
+MAPE_RWE <- RWE[[1]]
+Table_RWE<- RWE[[2]]
+
+```
+
+
+## RX1 Nottingham University Hospitals Total Admissions (both elective and non-elective)
+
+```{r, echo=FALSE, fig.height=4, fig.width=7}
+
+RX1_tsb<-cardiacsurgery_tsb %>%
+  filter(Der_Provider_Code=="RX1") %>%
+summarise(Total = sum(Admissions)) 
+
+#Seasonality check
+Seasonality(RX1_tsb, "Total")  
+
+#All admissions
+RX1<-cardiacsurgery %>%
+    filter(Der_Provider_Code=="RX1") %>%
+  group_by(Date)%>%
+   summarise(., Total = sum(Admissions)) %>%
+ mutate (., ds = Date, y = Total) 
+
+
+RX1<- Forecast_log_transform(RX1, "Nottingham University Hospitals", "Number")
+
+MAPE_RX1 <- RX1[[1]]
+Table_RX1<- RX1[[2]]
+
+```
+
+
+
+
+
+
+
+
+
+
+
+# Forecasting procedures - using prophets package
+
+## CABG
+
+```{r, echo=FALSE, fig.height=4, fig.width=7}
+
+# CABG 
+CABG<-cardiacsurgery_tsb %>%
+    summarise(., Total = sum(CABG))
+
+
+#Seasonality check
+Seasonality(CABG, "Total")  
+
+#CABG admissions
+CABG <-cardiacsurgery%>%
+  group_by(Date)%>%
+   summarise(., Total = sum(CABG)) %>%
+ mutate (., ds = Date, y = Total) 
+
+CABG<- Forecast_boxcox_transform(CABG, "Coronary Artery Bypass Graft", "Number")
+
+MAPE_CABG <- CABG[[1]]
+Table_CABG<- CABG[[2]]
+
+
+```
+
+## PCI
+
+```{r, echo=FALSE, fig.height=4, fig.width=7}
+
+# PCI 
+PCI<-cardiacsurgery_tsb %>%
+    summarise(., Total = sum(PCI))
+
+
+#Seasonality check
+Seasonality(PCI, "Total")  
+
+#PCI admissions
+PCI <-cardiacsurgery%>%
+  group_by(Date)%>%
+   summarise(., Total = sum(PCI)) %>%
+ mutate (., ds = Date, y = Total) 
+
+
+
+PCI<- Forecast_boxcox_transform(PCI, "Percutaneous Coronary Intervention", "Number")
+
+MAPE_PCI <-PCI[[1]]
+Table_PCI<-PCI[[2]]
+
+```
+
+## Valve Surgery (Pulmonary, mitral, triscuspid)
+no improvement with log transform, think the numbers are probably too small and too much variability
+```{r, echo=FALSE, fig.height=4, fig.width=7}
+
+# Valve_Surgery 
+#Valve_Surgery<-cardiacsurgery_tsb %>%
+  #  summarise(., Total = sum(Valve_Surgery))
+
+
+#Seasonality check
+#Seasonality(Valve_Surgery, "Total")  
+
+#Valve_Surgery admissions
+#Valve_Surgery <-cardiacsurgery%>%
+  #group_by(Date)%>%
+  # summarise(., Total = sum(Valve_Surgery)) %>%
+# mutate (., ds = Date, y = Total) 
+
+#Valve_Surgery<- Forecast_boxcox_transform(Valve_Surgery, "Valve Surgery", "Number")
+
+#MAPE_Valve_Surgery <-Valve_Surgery[[1]]
+#Table_Valve_Surgery<-Valve_Surgery[[2]]
+
+```
+
+## Surgical AVR
+
+```{r, echo=FALSE, fig.height=4, fig.width=7}
+
+
+# SurgicalAVR 
+SurgicalAVR<-cardiacsurgery_tsb %>%
+    summarise(., Total = sum(SurgicalAVR))
+
+
+#Seasonality check
+Seasonality(SurgicalAVR, "Total")  
+
+#SurgicalAVR admissions
+SurgicalAVR <-cardiacsurgery%>%
+  group_by(Date)%>%
+   summarise(., Total = sum(SurgicalAVR)) %>%
+ mutate (., ds = Date, y = Total) 
+
+SurgicalAVR<- Forecast_log_transform(SurgicalAVR, "Surgical AVR", "Number")
+
+MAPE_SurgicalAVR <-SurgicalAVR[[1]]
+Table_SurgicalAVR<-SurgicalAVR[[2]]
+
+
+```
+
+## TAVI
+worse using log transform
+```{r, echo=FALSE, fig.height=4, fig.width=7}
+
+# TAVI 
+TAVI<-cardiacsurgery_tsb %>%
+    summarise(., Total = sum(TAVI))
+
+
+#Seasonality check
+Seasonality(TAVI, "Total")  
+
+#TAVI admissions
+TAVI <-cardiacsurgery%>%
+  group_by(Date)%>%
+   summarise(., Total = sum(TAVI)) %>%
+ mutate (., ds = Date, y = Total) 
+
+TAVI<- Forecast_boxcox_transform(TAVI, "TAVI", "Number")
+
+MAPE_TAVI <-TAVI[[1]]
+Table_TAVI<-TAVI[[2]]
+
+```
+## Aorto Vascular Surgery
+log transform marginally better but still poor
+```{r, echo=FALSE, fig.height=4, fig.width=7}
+
+# AortoVascular_Surgery 
+#AortoVascular_Surgery<-cardiacsurgery_tsb %>%
+ #   summarise(., Total = sum(AortoVascular_Surgery))
+
+
+#Seasonality check
+#Seasonality(AortoVascular_Surgery, "Total")  
+
+#AortoVascular_Surgery admissions
+#AortoVascular_Surgery <-cardiacsurgery%>%
+#  group_by(Date)%>%
+#   summarise(., Total = sum(AortoVascular_Surgery)) %>%
+# mutate (., ds = Date, y = Total) 
+
+#AortoVascular_Surgery<- Forecast_log_transform(AortoVascular_Surgery, "AortoVascular Surgery", "Number")
+
+#MAPE_AortoVascular_Surgery <-AortoVascular_Surgery[[1]]
+#Table_AortoVascular_Surgery<-AortoVascular_Surgery[[2]]
+
+```
+
+# Generating table of admissions and LOS
+
+# Admissions
+
+```{r, echo=FALSE, fig.height=4, fig.width=6}
+
+Summarytable_Admissions<-rbind(Table_Admissions, Table_Elec_Admissions, Table_NonElec_Admissions)%>%
+  filter(.,ds >='2021-10-01')%>%
+   mutate(.,Date=ifelse((ds >='2021-10-01' & ds <'2022-10-01'), "Oct 21-Sept 22", ifelse((ds >='2022-10-01' & ds <'2023-10-01'), "Oct 22-Sept 23", ifelse((ds >='2023-10-01' & ds <'2024-10-01'), "Oct 23-Sept 24", ifelse((ds >='2024-10-01' & ds <'2025-10-01'), "Oct 24-Sept 25", ifelse((ds >='2025-10-01' & ds <'2026-10-01'), "Oct 25-Sept 26", ifelse((ds >='2026-10-01' & ds <'2027-10-01'), "Oct 26-Sept 27", ""))))))) %>%
+  group_by(Date, group)%>%
+  summarise(forecast=round(mean(forecast),0), actual=round(mean(actual),0), yhat_lower=round(min(yhat_lower),0),  yhat_upper=round(max(yhat_upper),0)) %>%
+    ungroup() %>%
+    mutate(`% change`=ifelse(group=="Elective Admissions", ((forecast-actual[1])/actual[1])*100, ifelse(group=="Non-Elective Admissions", ((forecast-actual[2])/actual[2])*100, ifelse(group=="Total Admissions", ((forecast-actual[3])/actual[3])*100, "")))) %>%
+  mutate(Value= ifelse(!is.na(actual), actual, paste0(forecast, " (",yhat_lower, "-", yhat_upper,")"))) %>%
+  select(-forecast, -yhat_lower, -yhat_upper, -actual, )%>%
+  mutate(`% change`=round(as.numeric(`% change`),1))%>%
+  mutate(`% change`=ifelse(Date== "Oct 21-Sept 22", NA,`% change` ) )%>%
+  pivot_wider(names_from = group, values_from = c(Value, `% change`)) 
+
+Summarytable_Admissions <- Summarytable_Admissions[, c(1,2,5, 3, 6, 4, 7)]
+
+
+
+
+#Admission Table Output 
+
+AdmissionsTable<- flextable(Summarytable_Admissions)%>%
+align(., align = "center")  %>%
+  set_header_labels(.,
+     Date="",
+    `Value_Elective Admissions`="Number (95% CI)",
+     `% change_Elective Admissions`="% change",
+    `Value_Non-Elective Admissions`= "Number (95% CI) ",
+    `% change_Non-Elective Admissions`= "% change",
+    `Value_Total Admissions`= "Number (95% CI)",  
+    `% change_Total Admissions`= "% change") %>%
+ add_header_row(values = c("", "Elective Admissions", "Non-Elective Admissions", "Total Admissions"), colwidths = c(1,2,2,2)) %>% 
+  align(., i = 1, part = "header", align = "center")%>% 
+ align(., i = 2, part = "header", align = "center") %>% 
+hline(.,  i = 1, part = "header", border=fp_border(color="#f9bf07")) %>%
+    vline(., i = 1, j=1, fp_border(color="white"), part="body")%>%
+  bg(., bg = "#f9bf07", part = "header")  %>%
+  set_caption(., "Summary of Predicted Monthly Admissions for Cardiac Procedures",  style = "Table Caption")%>%
+  hline_bottom (.,  border = fp_border(color="black", width = 2))%>%
+  hline_top(., part="all", border = fp_border(color="black", width = 2))%>%
+  bold(., i = 1, bold = TRUE)%>%
+  bold(., i = 1, bold = TRUE, part="header")%>%
+  add_footer_lines(.,values = c("% change relative to Oct 21-Sept 22")) %>%
+  autofit()%>% fit_to_width(8)
+
+
+AdmissionsTable
+
+save_as_docx(AdmissionsTable, path = "AdmissionsTable.docx")
+
+```
+
+67# Provider
+
+```{r, echo=FALSE, fig.height=4, fig.width=6}
+
+Summarytable_Providers<-rbind(Table_RJE, Table_RKB, Table_RL4, Table_RRK, Table_RWE, Table_RX1)%>%
+  filter(ds >='2021-10-01')%>%
+   mutate(.,Date=ifelse((ds >='2021-10-01' & ds <'2022-10-01'), "Oct 21-Sept 22", ifelse((ds >='2022-10-01' & ds <'2023-10-01'), "Oct 22-Sept 23", ifelse((ds >='2023-10-01' & ds <'2024-10-01'), "Oct 23-Sept 24", ifelse((ds >='2024-10-01' & ds <'2025-10-01'), "Oct 24-Sept 25", ifelse((ds >='2025-10-01' & ds <'2026-10-01'), "Oct 25-Sept 26", ifelse((ds >='2026-10-01' & ds <'2027-10-01'), "Oct 26-Sept 27", ""))))))) %>%
+  group_by(Date, group)%>%
+  summarise(forecast=round(mean(forecast),0), actual=round(mean(actual),0), yhat_lower=round(min(yhat_lower),0),  yhat_upper=round(max(yhat_upper),0))%>%
+    ungroup() %>%
+    mutate(`% change`=ifelse(group=="Nottingham University Hospitals", ((forecast-actual[1])/actual[1])*100, ifelse(group=="The Royal Wolverhampton", ((forecast-actual[2])/actual[2])*100, ifelse(group=="University Hospitals Birmingham", ((forecast-actual[3])/actual[3])*100, ifelse(group=="University Hospitals Coventry & Warwickshire", ((forecast-actual[4])/actual[4])*100, ifelse(group=="University Hospitals of Leicester", ((forecast-actual[5])/actual[5])*100, ifelse(group=="University Hospitals of North Midlands", ((forecast-actual[6])/actual[6])*100, ""))))))) %>%
+  mutate(Value= ifelse(!is.na(actual), actual, paste0(forecast, " (",yhat_lower, "-", yhat_upper,")"))) %>%
+  select(-forecast, -yhat_lower, -yhat_upper, -actual)%>%
+  mutate(`% change`=round(as.numeric(`% change`),1))%>%
+    mutate(`% change`=ifelse(Date== "Oct 21-Sept 22", NA,`% change` ) )%>%
+  pivot_wider(names_from = group, values_from = c(Value, `% change`)) 
+
+Summarytable_Providers <- Summarytable_Providers[, c(1,2, 8, 3, 9, 4,10,5,11,6,12,7,13)]
+
+
+
+#Admission Table Output 
+
+ProviderTable<-  flextable(Summarytable_Providers)%>%
+align(., align = "center")  %>%
+  set_header_labels(.,
+  Date ="",
+    `Value_Nottingham University Hospitals`="No. (95% CI)",
+     `% change_Nottingham University Hospitals`="% change",
+    `Value_The Royal Wolverhampton`= "No. (95% CI)",
+    `% change_The Royal Wolverhampton`= "% change",
+    `Value_University Hospitals Birmingham`= "No. (95% CI)", 
+    `% change_University Hospitals Birmingham`= "% change",
+      `Value_University Hospitals Coventry & Warwickshire`="No. (95% CI)",
+     `% change_University Hospitals Coventry & Warwickshire`="% change",
+    `Value_University Hospitals of Leicester`= "No. (95% CI)",
+    `% change_University Hospitals of Leicester`= "% change",
+    `Value_University Hospitals of North Midlands`= "No. (95% CI)",
+    `% change_University Hospitals of North Midlands`= "% change") %>%
+ add_header_row(values = c("", "Nottingham University Hospitals", "The Royal Wolverhampton", "University Hospitals Birmingham","University Hospitals Coventry & Warwickshire", "University Hospitals of Leicester", "University Hospitals of North Midlands"), colwidths = c(1,2,2,2,2,2,2)) %>% 
+  align(., i = 1, part = "header", align = "center")%>% 
+ align(., i = 2, part = "header", align = "center") %>% 
+hline(.,  i = 1, part = "header", border=fp_border(color="#f9bf07")) %>%
+    vline(., i = 1, j=1, fp_border(color="white"), part="body")%>%
+  bg(., bg = "#f9bf07", part = "header")  %>%
+  set_caption(., "Summary of Predicted Monthly Admissions for Cardiac Procedures at each Provider",  style = "Table Caption")%>%
+  hline_bottom (.,  border = fp_border(color="black", width = 2))%>%
+  hline_top(., part="all", border = fp_border(color="black", width = 2))%>%
+  bold(., i = 1, bold = TRUE)%>%
+    bold(., i = 1, bold = TRUE, part="header")%>%
+  add_footer_lines(.,values = c("% change relative to Oct 21-Sept 22")) %>%
+  autofit()
+
+
+ProviderTable
+
+save_as_docx(ProviderTable, path = "ProviderTable.docx")
+
+
+```
+
+# Length of Stay
+
+```{r, echo=FALSE, fig.height=4, fig.width=7}
+
+Summarytable_LOS<-rbind(Table_LOS_Elective, Table_LOS_non_elective, Table_LOS_Total, Table_Elec_MeanLOS, Table_MeanLOS_non_elective,  Table_MeanLOS)%>%
+  filter(ds >='2021-10-01')%>%
+   mutate(.,Date=ifelse((ds >='2021-10-01' & ds <'2022-10-01'), "Oct 21-Sept 22", ifelse((ds >='2022-10-01' & ds <'2023-10-01'), "Oct 22-Sept 23", ifelse((ds >='2023-10-01' & ds <'2024-10-01'), "Oct 23-Sept 24", ifelse((ds >='2024-10-01' & ds <'2025-10-01'), "Oct 24-Sept 25", ifelse((ds >='2025-10-01' & ds <'2026-10-01'), "Oct 25-Sept 26", ifelse((ds >='2026-10-01' & ds <'2027-10-01'), "Oct 26-Sept 27", ""))))))) %>%
+  group_by(Date, group)%>%
+  summarise(forecast=round(mean(forecast),1), actual=round(mean(actual),1), yhat_lower=round(min(yhat_lower),1),  yhat_upper=round(max(yhat_upper),1))%>%
+    ungroup() %>%
+    mutate(`% change`=ifelse(group=="Elective LOS", ((forecast-actual[1])/actual[1])*100, ifelse(group=="Non-Elective LOS", ((forecast-actual[5])/actual[5])*100, ifelse(group=="Total LOS", ((forecast-actual[6])/actual[6])*100, ifelse(group=="Mean Elective LOS", ((forecast-actual[2])/actual[2])*100, ifelse(group=="Mean Non-Elective LOS", ((forecast-actual[3])/actual[3])*100, ifelse(group=="Mean Total LOS", ((forecast-actual[4])/actual[4])*100, ""))))))) %>%
+  mutate(Value= ifelse(!is.na(actual), actual, paste0(forecast, " (",yhat_lower, "-", yhat_upper,")"))) %>%
+  select(-forecast, -yhat_lower, -yhat_upper, -actual)%>%
+  mutate(`% change`=round(as.numeric(`% change`),1))%>%
+  mutate(`% change`=ifelse(Date== "Oct 21-Sept 22", NA,`% change` ) )%>%
+  pivot_wider(names_from = group, values_from = c(Value, `% change`)) 
+
+Summarytable_LOS <- Summarytable_LOS[, c(1,2, 8, 6, 12, 7,13,3,9,4,10,5,11)]
+
+
+
+#LOS Table Output 
+
+LOSTable<-flextable(Summarytable_LOS)%>%
+align(., align = "center")  %>%
+  set_header_labels(.,
+    Date ="",
+    `Value_Elective LOS`="Number (95% CI)",
+     `% change_Elective LOS`="% change",
+    `Value_Non-Elective LOS`= "Number (95% CI) ",
+    `% change_Non-Elective LOS`= "% change",
+    `Value_Total LOS`= "Number (95% CI)",  
+    `% change_Total LOS`= "% change",
+      `Value_Mean Elective LOS`="Number (95% CI)",
+     `% change_Mean Elective LOS`="% change",
+    `Value_Mean Non-Elective LOS`= "Number (95% CI) ",
+    `% change_Mean Non-Elective LOS`= "% change",
+    `Value_Mean Total LOS`= "Number (95% CI)",  
+    `% change_Mean Total LOS`= "% change") %>%
+ add_header_row(values = c("", "Elective LOS", "Non-Elective LOS", "Total LOS", "Mean Elective LOS", "Mean Non-Elective LOS", "Mean Total LOS"), colwidths = c(1,2,2,2,2,2,2)) %>% 
+  align(., i = 1, part = "header", align = "center")%>% 
+ align(., i = 2, part = "header", align = "center") %>% 
+hline(.,  i = 1, part = "header", border=fp_border(color="#f9bf07")) %>%
+    vline(., i = 1, j=1, fp_border(color="white"), part="body")%>%
+  bg(., bg = "#f9bf07", part = "header")  %>%
+  set_caption(., "Summary of Predicted Monthly Admissions for Cardiac Procedures at each Provider",  style = "Table Caption")%>%
+  hline_bottom (.,  border = fp_border(color="black", width = 2))%>%
+  hline_top(., part="all", border = fp_border(color="black", width = 2))%>%
+  bold(., i = 1, bold = TRUE)%>%
+    bold(., i = 1, bold = TRUE, part="header")%>%
+  add_footer_lines(.,values = c("% change relative to Oct 21-Sept 22")) %>%
+  autofit()
+
+
+
+LOSTable
+
+
+save_as_docx(LOSTable, path = "LOSTable.docx")
+
+```
+
+# Procedure
+
+```{r, echo=FALSE, fig.height=4, fig.width=7}
+
+Summarytable_Procedure<-rbind(Table_SurgicalAVR, Table_TAVI, Table_CABG, Table_PCI)%>%
+  filter(ds >='2021-10-01')%>%
+   mutate(.,Date=ifelse((ds >='2021-10-01' & ds <'2022-10-01'), "Oct 21-Sept 22", ifelse((ds >='2022-10-01' & ds <'2023-10-01'), "Oct 22-Sept 23", ifelse((ds >='2023-10-01' & ds <'2024-10-01'), "Oct 23-Sept 24", ifelse((ds >='2024-10-01' & ds <'2025-10-01'), "Oct 24-Sept 25", ifelse((ds >='2025-10-01' & ds <'2026-10-01'), "Oct 25-Sept 26", ifelse((ds >='2026-10-01' & ds <'2027-10-01'), "Oct 26-Sept 27", ""))))))) %>%
+  group_by(Date, group)%>%
+  summarise(forecast=round(mean(forecast),0), actual=round(mean(actual),0), yhat_lower=round(min(yhat_lower),0),  yhat_upper=round(max(yhat_upper),0))%>%
+    ungroup() %>%
+    mutate(`% change`=ifelse(group=="Coronary Artery Bypass Graft", ((forecast-actual[1])/actual[1])*100, ifelse(group=="Percutaneous Coronary Intervention", ((forecast-actual[2])/actual[2])*100, ifelse(group=="Surgical AVR", ((forecast-actual[3])/actual[3])*100, ifelse(group=="TAVI", ((forecast-actual[4])/actual[4])*100, ""))))) %>%
+  mutate(Value= ifelse(!is.na(actual), actual, paste0(forecast, " (",yhat_lower, "-", yhat_upper,")"))) %>%
+  select(-forecast, -yhat_lower, -yhat_upper, -actual)%>%
+  mutate(`% change`=round(as.numeric(`% change`),1))%>%
+   mutate(`% change`=ifelse(Date== "Oct 21-Sept 22", NA,`% change` ) )%>%
+  pivot_wider(names_from = group, values_from = c(Value, `% change`)) 
+
+Summarytable_Procedure <- Summarytable_Procedure[, c(1,4, 8, 5, 9, 2,6,3,7)]
+
+
+
+
+#Admission Table Output 
+
+ProcedureTable<-flextable(Summarytable_Procedure)%>%
+align(., align = "center")  %>%
+  set_header_labels(.,
+    Quarter ="",
+    `Value_Coronary Artery Bypass Graft`= "No. (95% CI)",
+    `% change_Coronary Artery Bypass Graft`= "% change",
+    `Value_Percutaneous Coronary Intervention`= "No. (95% CI)", 
+    `% change_Percutaneous Coronary Intervention`= "% change",
+      `Value_Surgical AVR`="No. (95% CI)",
+     `% change_Surgical AVR`="% change",
+    `Value_TAVI`= "No. (95% CI)",
+    `% change_TAVI`= "% change") %>%
+ add_header_row(values = c("", "Surgical AVR", "TAVI", "CABG", "PCI"), colwidths = c(1,2,2,2,2)) %>% 
+  align(., i = 1, part = "header", align = "center")%>% 
+ align(., i = 2, part = "header", align = "center") %>% 
+hline(.,  i = 1, part = "header", border=fp_border(color="#f9bf07")) %>%
+    vline(., i = 1, j=1, fp_border(color="white"), part="body")%>%
+  bg(., bg = "#f9bf07", part = "header")  %>%
+  set_caption(., "Summary of Predicted Monthly Admissions for Cardiac Procedures at each Provider",  style = "Table Caption")%>%
+ hline_bottom (.,  border = fp_border(color="black", width = 2))%>%
+  hline_top(., part="all", border = fp_border(color="black", width = 2))%>%
+  bold(., i = 1, bold = TRUE)%>%
+    bold(., i = 1, bold = TRUE, part="header")%>%
+  add_footer_lines(.,values = c("% change relative to Oct 21-Sept 22")) %>%
+  autofit()
+
+
+ProcedureTable
+
+
+save_as_docx(ProcedureTable, path = "ProcedureTable.docx")
+
+```
+
