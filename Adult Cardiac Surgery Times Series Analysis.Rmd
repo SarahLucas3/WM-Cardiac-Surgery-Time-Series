@@ -22,7 +22,7 @@ library(officer)
 
 
 
-cardiacsurgery <- read_csv(file = "cardiac.csv", col_types = cols(Date=col_date(format = "%b-%y")))
+cardiacsurgery <- read_csv(file = "cardiac-old.csv", col_types = cols(Date=col_date(format = "%b-%y")))
 
 # Set dates
 cardiacsurgery$Date <- make_date( year= cardiacsurgery$adm_year, month= cardiacsurgery$adm_month, day=1)
