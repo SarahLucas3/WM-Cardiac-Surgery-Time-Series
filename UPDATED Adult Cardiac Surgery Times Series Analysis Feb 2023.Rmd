@@ -2,9 +2,13 @@
 title: "Adult Cardiac Surgery Time Series Analysis"
 output: github_document
 date: '2022-10-06'
+
 ---
 
 ```{r setup, include=FALSE}
+
+
+
 
 knitr::opts_chunk$set(echo = TRUE, warning= FALSE, message= FALSE)
 library(readr)
@@ -49,12 +53,13 @@ cardiacsurgery$procedures<- (cardiacsurgery$SurgicalAVR + cardiacsurgery$TAVI+ c
 
 # Filtering only the procedures of interest and 6 surgical centres, and Surgical only 
 cardiacsurgery<-cardiacsurgery %>%
-  filter(AdmissionsProcedure==1) 
+  filter(AdmissionsProcedure==1 & Surgical_Centre==1) 
+
 
 # Create tsibble
 cardiacsurgery_tsb <- cardiacsurgery %>% 
   mutate(Month = yearmonth(Date))%>%
-  as_tsibble(key=c(Der_Provider_Code, Admit_Method, Mids_Centre, Surgical_Centre, Non_Surgical, mids_region), index = Month)
+  as_tsibble(key=c(Der_Provider_Code, Admit_Method, Surgical), index = Month)
 
 #Check for gaps in the data
 has_gaps(cardiacsurgery_tsb)
