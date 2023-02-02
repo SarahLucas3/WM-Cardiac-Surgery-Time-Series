@@ -47,15 +47,14 @@ cardiacsurgery$CABG<-(cardiacsurgery$CABG+cardiacsurgery$Other_Coronary_Artery_S
 
 cardiacsurgery$procedures<- (cardiacsurgery$SurgicalAVR + cardiacsurgery$TAVI+ cardiacsurgery$AortoVascular_Surgery + cardiacsurgery$Mitral_Valve_Surgery + cardiacsurgery$Tricuspid_Valve_Surgery+ cardiacsurgery$Pulmonary_Valve_Surgery+ cardiacsurgery$Cardiac_Valve_Surgery +cardiacsurgery$PCI + cardiacsurgery$CABG )
 
-# Filtering only the procedures of interest
-cardiacsurgery<-subset(cardiacsurgery, cardiacsurgery$AdmissionsProcedure==1)
-
+# Filtering only the procedures of interest and 6 surgical centres, and Surgical only 
+cardiacsurgery<-cardiacsurgery %>%
+  filter(AdmissionsProcedure==1) 
 
 # Create tsibble
 cardiacsurgery_tsb <- cardiacsurgery %>% 
   mutate(Month = yearmonth(Date))%>%
-  as_tsibble(key=c(Der_Provider_Code, Admit_Method), index = Month)
-
+  as_tsibble(key=c(Der_Provider_Code, Admit_Method, Mids_Centre, Surgical_Centre, Non_Surgical, mids_region), index = Month)
 
 #Check for gaps in the data
 has_gaps(cardiacsurgery_tsb)
@@ -89,7 +88,7 @@ ggplot(aes(x = Month, y =TotalAdmit)) +
   theme(panel.grid.major.y = element_line(color = "grey80"), panel.grid.major.x =  element_blank(), panel.grid.minor.x =  element_blank(), panel.border = element_blank(), axis.line = element_line(colour = "black", size=1),
         axis.text.x = element_text(size = 12), axis.text.y = element_text(size = 12), 
         axis.title.x = element_text(size = 14), axis.title.y = element_text(size = 14,vjust=2), 
-        legend.text=element_text(size=12),legend.title=element_blank(),plot.title = element_text(size=14), legend.position= c(0.85, 0.8))+          
+        legend.text=element_text(size=12),legend.title=element_blank(),plot.title = element_text(size=14), legend.position= c(0.85, 0.8))+      
  scale_y_continuous(expand = c(0, 0), limits=c(0,1200, 200))
 
 
