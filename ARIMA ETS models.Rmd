@@ -1,0 +1,1432 @@
+---
+title: "Untitled"
+output: word_document
+date: "2023-02-06"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning= FALSE, message= FALSE)
+library(readr)
+library(tidyverse)
+library(lubridate)
+library(fpp3)
+library(rlang)
+library(ggpubr)
+library(reshape2)
+library(prophet)
+library(gridExtra)
+library(flextable)
+library(officer)
+library(fable.prophet)
+library(forecast)
+
+detach(package:forecast,unload=TRUE)
+
+cardiac <- read_csv(file = "cardiac.csv", col_types = cols(Date=col_date(format = "%b-%y")))
+
+# Set dates
+cardiac$Date <- make_date( year= cardiac$adm_year, month= cardiac$adm_month, day=1)
+cardiac <-cardiac %>%
+  filter(between(cardiac$Date , as.Date('2012-04-01'), as.Date('2022-09-01')))
+
+cardiac$Valve_Surgery<- (cardiac$Mitral_Valve_Surgery+ cardiac$Tricuspid_Valve_Surgery + cardiac$Pulmonary_Valve_Surgery + cardiac$Cardiac_Valve_Surgery)
+
+
+# Filtering only the procedures of interest and 6 surgical centres, and Surgical only 
+cardiacsurgery<-cardiac %>%
+  filter(Midlands_Centre==1 & Surgical==1) %>%
+  dplyr::select(-Non_Midlands_Centre, -Midlands_Centre, -Surgical) %>%
+  group_by(adm_year, adm_month,Der_Provider_Code, Admit_Method, Date)%>% 
+  summarise(across(everything(), list(sum)), .groups='drop')%>%
+  dplyr::select(-mids_region_1)%>%
+  rename(SurgicalAVR=SurgicalAVR_1, TAVI=TAVI_1, Valve_Surgery=Valve_Surgery_1, CABG=CABG_1,
+         AortoVascular_Surgery=AortoVascular_Surgery_1, PCI=PCI_1 )
+
+
+# Create tsibble
+cardiacsurgery_tsb <- cardiacsurgery %>% 
+  mutate(Month = yearmonth(Date))%>%
+  as_tsibble(key=c(Der_Provider_Code, Admit_Method), index = Month)
+
+#Check for gaps in the data
+has_gaps(cardiacsurgery_tsb)
+scan_gaps(cardiacsurgery_tsb)
+
+#Data frame of COVID-19 lockdowns (using the 1st of the month for the start dates as we have monthly data, and so the whole month of data could be affected )
+holiday<- c("Lockdown1", "Lockdown2", "Lockdown3")
+ds<-as.Date(c("2020-03-01","2020-11-01", "2021-01-01"))
+lower_window<-c(0,0,0)
+ds_upper<-as.Date(c("2020-05-10","2020-12-02", "2021-03-08"))
+Lockdowns <- data.frame(holiday, ds, lower_window, ds_upper)
+Lockdowns$upper_window<-(ds_upper-ds)
+
+
+# Filtering only the procedures of interest and 6 surgical centres, and Surgical only 
+PCITAVI<-cardiac %>%
+  filter(Surgical==0 & mids_region==1) %>%
+   dplyr::select(-Non_Midlands_Centre, -Midlands_Centre, -Surgical, -Der_Provider_Code, -mids_region) %>%
+   group_by(adm_year, adm_month, Admit_Method, Date)%>% 
+  summarise(across(everything(), list(sum)), .groups='drop') %>%
+  rename(TAVI=TAVI_1, PCI=PCI_1 )
+
+
+# Create tsibble
+PCITAVI_tsb <- PCITAVI %>% 
+  mutate(Month = yearmonth(Date))%>%
+  as_tsibble(key=c(Admit_Method), index = Month)
+
+```
+
+# Admissions
+
+## Elective admissions
+```{r, echo=FALSE, fig.height=4, fig.width=7}
+
+    # New tsibble with only elective admission data included
+    Admission_tsb<-filter(cardiacsurgery_tsb, Admit_Method=="Elective") %>%
+    summarise(., Total = sum(Admissions_1)) 
+
+    # Automatic ARIMA/ETS to fit model
+    ElectiveAdmit_fit<-Admission_tsb%>%
+    slice(-n()) %>%
+    stretch_tsibble(.init = 36, .step=6)   %>%
+     model( arima= ARIMA(log(Total)),
+            ets=ETS(log(Total)))
+
+  ElectiveAdmit_fit%>%
+    forecast(h = 12) %>%
+    accuracy(Admission_tsb)
+  
+  
+        Table_ElectiveAdmit<-    Admission_tsb%>%
+    model( arima= ARIMA(log(Total))) %>%
+    forecast(h = 60) %>%
+    hilo() %>%
+  rowwise() %>%
+  mutate(across(c(`95%`), ~toString(unlist(.))))
+        
+       Table_ElectiveAdmit[c('Lower', 'Upper', 'PI')] <- str_split_fixed(  Table_ElectiveAdmit$`95%`, ',', 3)
+       
+# Table of the last 12 months of data to calculate % change
+   a <-   cardiacsurgery%>%
+         filter(Date >='2021-10-01' & Date <'2022-10-01' & Admit_Method=="Elective") %>%
+   summarise(., Total = sum(Admissions_1)/12) 
+         
+ #Preparing table data       
+     Table_ElectiveAdmit <- Table_ElectiveAdmit%>%
+        rowwise() %>% 
+        ungroup() %>%
+         mutate(Lower=as.numeric(as.character(Lower)))%>%
+         mutate(Upper=as.numeric(as.character(Upper))) %>%
+        mutate(Month=as.Date(Month, "%Y %b"))%>%
+              dplyr::select(-.model, -`80%`,-`95%`, -Total, -PI) %>%
+           mutate(actual=NA)%>%
+         add_row(Month=NA, .mean = NA, Lower= NA, Upper=NA, actual=a$Total)%>%
+       mutate(group="Elective Admissions")
+     
+      Admission_tsb  <-   Admission_tsb %>%
+        mutate(Date=as.Date(Month, "%Y %b"))
+              
+     ggplot()+
+    geom_line(Admission_tsb, mapping=aes(x =Date, y= Total), color="black", size=1) + 
+    geom_line(  Table_ElectiveAdmit, mapping=aes(x = Month, y= .mean), color="#5881c1", size=1) +
+  geom_ribbon(  Table_ElectiveAdmit,mapping= aes(x= Month, ymin = Lower, ymax = Upper), fill="#5881c1", alpha = 0.3)+
+  labs( title = "Elective admissions",y = "Number", x="")+
+  theme_bw()+
+  theme(panel.grid.major.y = element_line(color = "grey80"), panel.grid.major.x =  element_blank(), panel.grid.minor.x =  element_blank(),    panel.border = element_blank(), axis.line = element_line(colour = "black", size=1),
+        axis.text.x = element_text(size = 12), axis.text.y = element_text(size = 12), 
+        axis.title.x = element_text(size = 14), axis.title.y = element_text(size = 14,vjust=2), 
+        legend.text=element_text(size=12),legend.title=element_blank(),plot.title = element_text(size=14), legend.position= c(0.15, 0.2)) + 
+      scale_x_date(date_breaks = "3 years", date_labels = "%b-%Y")+
+  scale_y_continuous(expand = c(0, 0), limits=c(0,550, 100)) 
+
+  
+     Admission_tsb%>%
+    model( arima= ARIMA(log(Total)))  %>%
+  gg_tsresiduals()
+```
+
+## Non- elective admissions
+
+```{r, echo=FALSE, fig.height=4, fig.width=7}
+ # New tsibble with only elective admission data included
+    Admission_tsb<-filter(cardiacsurgery_tsb, Admit_Method=="Non-elective") %>%
+    summarise(., Total = sum(Admissions_1)) 
+
+    # Automatic ARIMA/ETS to fit model
+    NonElectiveAdmit_fit<-Admission_tsb%>%
+    slice(-n()) %>%
+    stretch_tsibble(.init = 36, .step=6)   %>%
+     model( arima= ARIMA(Total),
+            ets=ETS(Total))
+    
+    
+     NonElectiveAdmit_fit%>%
+    forecast(h = 12) %>%
+    accuracy(Admission_tsb)
+     
+     
+      Table_NonElectiveAdmit<-    Admission_tsb%>%
+    model( arima= ARIMA(Total)) %>%
+    forecast(h = 60) %>%
+    hilo() %>%
+  rowwise() %>%
+  mutate(across(c(`95%`), ~toString(unlist(.))))
+        
+       Table_NonElectiveAdmit[c('Lower', 'Upper', 'PI')] <- str_split_fixed(  Table_NonElectiveAdmit$`95%`, ',', 3)
+       
+   # Table of the last 12 months of data to calculate % change
+   a <-   cardiacsurgery%>%
+         filter(Date >='2021-10-01' & Date <'2022-10-01' & Admit_Method=="Non-elective") %>%
+   summarise(., Total = sum(Admissions_1)/12) 
+         
+ #Preparing table data       
+     Table_NonElectiveAdmit <- Table_NonElectiveAdmit%>%
+        rowwise() %>% 
+        ungroup() %>%
+         mutate(Lower=as.numeric(as.character(Lower)))%>%
+         mutate(Upper=as.numeric(as.character(Upper))) %>%
+        mutate(Month=as.Date(Month, "%Y %b"))%>%
+              dplyr::select(-.model, -`80%`,-`95%`, -Total, -PI) %>%
+           mutate(actual=NA)%>%
+         add_row(Month=NA, .mean = NA, Lower= NA, Upper=NA, actual=a$Total)%>%
+       mutate(group="Non-Elective Admissions")
+      
+      Admission_tsb  <-   Admission_tsb %>%
+        mutate(Date=as.Date(Month, "%Y %b"))
+              
+     ggplot()+
+    geom_line(Admission_tsb, mapping=aes(x =Date, y= Total), color="black", size=1) + 
+    geom_line(  Table_NonElectiveAdmit, mapping=aes(x = Month, y= .mean), color="#5881c1", size=1) +
+  geom_ribbon(  Table_NonElectiveAdmit,mapping= aes(x= Month, ymin = Lower, ymax = Upper), fill="#5881c1", alpha = 0.3)+
+  labs( title = "Non Elective admissions",y = "Number", x="")+
+  theme_bw()+
+  theme(panel.grid.major.y = element_line(color = "grey80"), panel.grid.major.x =  element_blank(), panel.grid.minor.x =  element_blank(),    panel.border = element_blank(), axis.line = element_line(colour = "black", size=1),
+        axis.text.x = element_text(size = 12), axis.text.y = element_text(size = 12), 
+        axis.title.x = element_text(size = 14), axis.title.y = element_text(size = 14,vjust=2), 
+        legend.text=element_text(size=12),legend.title=element_blank(),plot.title = element_text(size=14), legend.position= c(0.15, 0.2)) + 
+      scale_x_date(date_breaks = "3 years", date_labels = "%b-%Y")+
+  scale_y_continuous(expand = c(0, 0), limits=c(0,200, 100)) 
+    
+     Admission_tsb%>%
+    model(arima=ARIMA(Total))  %>%
+  gg_tsresiduals()
+```
+
+## Total admissions
+
+```{r, echo=FALSE, fig.height=4, fig.width=7}
+ # New tsibble with only elective admission data included
+    Admission_tsb<-cardiacsurgery_tsb %>%
+    summarise(., Total = sum(Admissions_1)) 
+
+    # Automatic ARIMA/ETS to fit model
+    TotalAdmit_fit<-Admission_tsb%>%
+    slice(-n()) %>%
+    stretch_tsibble(.init = 36, .step=6)   %>%
+     model( arima= ARIMA(log(Total)),
+            ets=ETS(log(Total)))
+    
+
+    TotalAdmit_fit%>%
+    forecast(h = 12) %>%
+    accuracy(Admission_tsb)
+    
+        Table_TotalAdmit<-    Admission_tsb%>%
+    model( arima= ARIMA(log(Total))) %>%
+    forecast(h = 60) %>%
+    hilo() %>%
+  rowwise() %>%
+  mutate(across(c(`95%`), ~toString(unlist(.))))
+        
+       Table_TotalAdmit[c('Lower', 'Upper', 'PI')] <- str_split_fixed(  Table_TotalAdmit$`95%`, ',', 3)
+       
+   # Table of the last 12 months of data to calculate % change
+   a <-   cardiacsurgery%>%
+         filter(Date >='2021-10-01' & Date <'2022-10-01') %>%
+   summarise(., Total = sum(Admissions_1)/12) 
+         
+ #Preparing table data       
+     Table_TotalAdmit <- Table_TotalAdmit%>%
+        rowwise() %>% 
+        ungroup() %>%
+         mutate(Lower=as.numeric(as.character(Lower)))%>%
+         mutate(Upper=as.numeric(as.character(Upper))) %>%
+        mutate(Month=as.Date(Month, "%Y %b"))%>%
+              dplyr::select(-.model, -`80%`,-`95%`, -Total, -PI) %>%
+           mutate(actual=NA)%>%
+         add_row(Month=NA, .mean = NA, Lower= NA, Upper=NA, actual=a$Total)%>%
+       mutate(group="Total Admissions")
+      
+      Admission_tsb  <-   Admission_tsb %>%
+        mutate(Date=as.Date(Month, "%Y %b"))
+              
+     ggplot()+
+    geom_line(Admission_tsb, mapping=aes(x =Date, y= Total), color="black", size=1) + 
+    geom_line(  Table_TotalAdmit, mapping=aes(x = Month, y= .mean), color="#5881c1", size=1) +
+  geom_ribbon(  Table_TotalAdmit,mapping= aes(x= Month, ymin = Lower, ymax = Upper), fill="#5881c1", alpha = 0.3)+
+  labs( title = "Total admissions",y = "Number", x="")+
+  theme_bw()+
+  theme(panel.grid.major.y = element_line(color = "grey80"), panel.grid.major.x =  element_blank(), panel.grid.minor.x =  element_blank(),    panel.border = element_blank(), axis.line = element_line(colour = "black", size=1),
+        axis.text.x = element_text(size = 12), axis.text.y = element_text(size = 12), 
+        axis.title.x = element_text(size = 14), axis.title.y = element_text(size = 14,vjust=2), 
+        legend.text=element_text(size=12),legend.title=element_blank(),plot.title = element_text(size=14), legend.position= c(0.15, 0.2)) + 
+      scale_x_date(date_breaks = "3 years", date_labels = "%b-%Y")+
+  scale_y_continuous(expand = c(0, 0), limits=c(0,650, 100)) 
+  
+
+    
+     Admission_tsb%>%
+    model(arima= ARIMA(log(Total)))  %>%
+  gg_tsresiduals()
+```
+
+
+# Mean LOS
+
+## Elective LOS
+```{r, echo=FALSE, fig.height=4, fig.width=7}
+
+    # New tsibble with only elective admission data included
+    LOS_tsb<-filter(cardiacsurgery_tsb, Admit_Method=="Elective") %>%
+   summarise(., Total = (sum(epi_los_1)/sum(Episodes_1))) 
+
+    # Automatic ARIMA/ETS to fit model
+    ElectiveLOS_fit<-LOS_tsb%>%
+    slice(-n()) %>%
+    stretch_tsibble(.init = 36, .step=6)   %>%
+     model( arima= ARIMA(Total),
+            ets=ETS(Total))
+    
+    
+    ElectiveLOS_fit%>%
+    forecast(h = 12) %>%
+    accuracy(LOS_tsb)
+    
+    
+    
+        Table_ElectiveLOS<-    LOS_tsb%>%
+    model( arima= ARIMA(Total)) %>%
+    forecast(h = 60) %>%
+    hilo() %>%
+  rowwise() %>%
+  mutate(across(c(`95%`), ~toString(unlist(.))))
+        
+       Table_ElectiveLOS[c('Lower', 'Upper', 'PI')] <- str_split_fixed(  Table_ElectiveLOS$`95%`, ',', 3)
+       
+    # Table of the last 12 months of data to calculate % change
+   a <-   cardiacsurgery%>%
+         filter(Date >='2021-10-01' & Date <'2022-10-01' & Admit_Method=="Elective") %>%
+   summarise(., Total = (sum(epi_los_1)/sum(Episodes_1))) 
+         
+ #Preparing table data       
+     Table_ElectiveLOS <- Table_ElectiveLOS%>%
+        rowwise() %>% 
+        ungroup() %>%
+         mutate(Lower=as.numeric(as.character(Lower)))%>%
+         mutate(Upper=as.numeric(as.character(Upper))) %>%
+        mutate(Month=as.Date(Month, "%Y %b"))%>%
+              dplyr::select(-.model, -`80%`,-`95%`, -Total, -PI) %>%
+           mutate(actual=NA)%>%
+         add_row(Month=NA, .mean = NA, Lower= NA, Upper=NA, actual=a$Total)%>%
+       mutate(group="Mean Elective LOS")
+     
+     
+     
+   LOS_tsb  <-   LOS_tsb %>%
+        mutate(Date=as.Date(Month, "%Y %b"))
+              
+     ggplot()+
+    geom_line(LOS_tsb, mapping=aes(x =Date, y= Total), color="black", size=1) + 
+    geom_line(  Table_ElectiveLOS, mapping=aes(x = Month, y= .mean), color="#5881c1", size=1) +
+  geom_ribbon(  Table_ElectiveLOS,mapping= aes(x= Month, ymin = Lower, ymax = Upper), fill="#5881c1", alpha = 0.3)+
+  labs( title = "Elective mean LOS",y = "Number", x="")+
+  theme_bw()+
+  theme(panel.grid.major.y = element_line(color = "grey80"), panel.grid.major.x =  element_blank(), panel.grid.minor.x =  element_blank(),    panel.border = element_blank(), axis.line = element_line(colour = "black", size=1),
+        axis.text.x = element_text(size = 12), axis.text.y = element_text(size = 12), 
+        axis.title.x = element_text(size = 14), axis.title.y = element_text(size = 14,vjust=2), 
+        legend.text=element_text(size=12),legend.title=element_blank(),plot.title = element_text(size=14), legend.position= c(0.15, 0.2)) + 
+      scale_x_date(date_breaks = "3 years", date_labels = "%b-%Y")+
+  scale_y_continuous(expand = c(0, 0), limits=c(0,13.5, 2)) 
+
+    
+     LOS_tsb%>%
+    model(arima=ARIMA(Total))  %>%
+  gg_tsresiduals()
+```
+
+## Non- elective LOS
+
+```{r, echo=FALSE, fig.height=4, fig.width=7}
+ # New tsibble with only elective admission data included
+    LOS_tsb<-filter(cardiacsurgery_tsb, Admit_Method=="Non-elective") %>%
+       summarise(., Total = (sum(epi_los_1)/sum(Episodes_1))) 
+
+    # Automatic ARIMA/ETS to fit model
+    NonElectiveLOS_fit<-LOS_tsb%>%
+    slice(-n()) %>%
+    stretch_tsibble(.init = 36, .step=6)   %>%
+     model( arima= ARIMA(Total),
+            ets=ETS(Total))
+    
+    
+     NonElectiveLOS_fit%>%
+    forecast(h = 12) %>%
+    accuracy(LOS_tsb)
+     
+     
+           Table_NonElectiveLOS<-    LOS_tsb%>%
+    model( arima= ARIMA(Total)) %>%
+    forecast(h = 60) %>%
+    hilo() %>%
+  rowwise() %>%
+  mutate(across(c(`95%`), ~toString(unlist(.))))
+        
+       Table_NonElectiveLOS[c('Lower', 'Upper', 'PI')] <- str_split_fixed(  Table_NonElectiveLOS$`95%`, ',', 3)
+       
+  # Table of the last 12 months of data to calculate % change
+   a <-   cardiacsurgery%>%
+         filter(Date >='2021-10-01' & Date <'2022-10-01' & Admit_Method=="Non-elective" ) %>%
+   summarise(., Total = (sum(epi_los_1)/sum(Episodes_1))) 
+         
+ #Preparing table data       
+     Table_NonElectiveLOS <- Table_NonElectiveLOS%>%
+        rowwise() %>% 
+        ungroup() %>%
+         mutate(Lower=as.numeric(as.character(Lower)))%>%
+         mutate(Upper=as.numeric(as.character(Upper))) %>%
+        mutate(Month=as.Date(Month, "%Y %b"))%>%
+              dplyr::select(-.model, -`80%`,-`95%`, -Total, -PI) %>%
+           mutate(actual=NA)%>%
+         add_row(Month=NA, .mean = NA, Lower= NA, Upper=NA, actual=a$Total)%>%
+       mutate(group="Mean Non-Elective LOS")
+     
+     
+      
+      LOS_tsb  <-   LOS_tsb %>%
+        mutate(Date=as.Date(Month, "%Y %b"))
+              
+     ggplot()+
+    geom_line(LOS_tsb, mapping=aes(x =Date, y= Total), color="black", size=1) + 
+    geom_line(  Table_NonElectiveLOS, mapping=aes(x = Month, y= .mean), color="#5881c1", size=1) +
+  geom_ribbon(  Table_NonElectiveLOS,mapping= aes(x= Month, ymin = Lower, ymax = Upper), fill="#5881c1", alpha = 0.3)+
+  labs( title = "Non-elective mean LOS",y = "Number", x="")+
+  theme_bw()+
+  theme(panel.grid.major.y = element_line(color = "grey80"), panel.grid.major.x =  element_blank(), panel.grid.minor.x =  element_blank(),    panel.border = element_blank(), axis.line = element_line(colour = "black", size=1),
+        axis.text.x = element_text(size = 12), axis.text.y = element_text(size = 12), 
+        axis.title.x = element_text(size = 14), axis.title.y = element_text(size = 14,vjust=2), 
+        legend.text=element_text(size=12),legend.title=element_blank(),plot.title = element_text(size=14), legend.position= c(0.15, 0.2)) + 
+      scale_x_date(date_breaks = "3 years", date_labels = "%b-%Y")+
+  scale_y_continuous(expand = c(0, 0), limits=c(0,18, 100)) 
+
+    
+    
+     LOS_tsb%>%
+    model(arima=ARIMA(Total))  %>%
+  gg_tsresiduals()
+```
+
+## Total LOS
+
+```{r, echo=FALSE, fig.height=4, fig.width=7}
+ # New tsibble with only elective admission data included
+    LOS_tsb<-cardiacsurgery_tsb %>%
+     summarise(., Total = (sum(epi_los_1)/sum(Episodes_1))) 
+
+    # Automatic ARIMA/ETS to fit model
+    TotalLOS_fit<-LOS_tsb%>%
+    slice(-n()) %>%
+    stretch_tsibble(.init = 36, .step=6)   %>%
+     model( arima= ARIMA(Total),
+            ets=ETS(Total))
+    
+    
+    TotalLOS_fit%>%
+    forecast(h = 12) %>%
+    accuracy(LOS_tsb)
+    
+          Table_TotalLOS<-    LOS_tsb%>%
+    model( arima= ARIMA(Total)) %>%
+    forecast(h = 60) %>%
+    hilo() %>%
+  rowwise() %>%
+  mutate(across(c(`95%`), ~toString(unlist(.))))
+        
+        Table_TotalLOS[c('Lower', 'Upper', 'PI')] <- str_split_fixed(  Table_TotalLOS$`95%`, ',', 3)
+       
+  # Table of the last 12 months of data to calculate % change
+   a <-   cardiacsurgery%>%
+         filter(Date >='2021-10-01' & Date <'2022-10-01') %>%
+   summarise(., Total = (sum(epi_los_1)/sum(Episodes_1))) 
+         
+ #Preparing table data       
+     Table_TotalLOS <- Table_TotalLOS%>%
+        rowwise() %>% 
+        ungroup() %>%
+         mutate(Lower=as.numeric(as.character(Lower)))%>%
+         mutate(Upper=as.numeric(as.character(Upper))) %>%
+        mutate(Month=as.Date(Month, "%Y %b"))%>%
+              dplyr::select(-.model, -`80%`,-`95%`, -Total, -PI) %>%
+           mutate(actual=NA)%>%
+         add_row(Month=NA, .mean = NA, Lower= NA, Upper=NA, actual=a$Total)%>%
+       mutate(group="Mean Total LOS")
+     
+      LOS_tsb  <-   LOS_tsb %>%
+        mutate(Date=as.Date(Month, "%Y %b"))
+              
+     ggplot()+
+    geom_line(LOS_tsb, mapping=aes(x =Date, y= Total), color="black", size=1) + 
+    geom_line( Table_TotalLOS, mapping=aes(x = Month, y= .mean), color="#5881c1", size=1) +
+  geom_ribbon( Table_TotalLOS,mapping= aes(x= Month, ymin = Lower, ymax = Upper), fill="#5881c1", alpha = 0.3)+
+  labs( title = "Total mean LOS",y = "Number", x="")+
+  theme_bw()+
+  theme(panel.grid.major.y = element_line(color = "grey80"), panel.grid.major.x =  element_blank(), panel.grid.minor.x =  element_blank(),    panel.border = element_blank(), axis.line = element_line(colour = "black", size=1),
+        axis.text.x = element_text(size = 12), axis.text.y = element_text(size = 12), 
+        axis.title.x = element_text(size = 14), axis.title.y = element_text(size = 14,vjust=2), 
+        legend.text=element_text(size=12),legend.title=element_blank(),plot.title = element_text(size=14), legend.position= c(0.15, 0.2)) + 
+      scale_x_date(date_breaks = "3 years", date_labels = "%b-%Y")+
+  scale_y_continuous(expand = c(0, 0), limits=c(0,18, 100)) 
+
+    
+     LOS_tsb%>%
+    model(arima=ARIMA(Total))  %>%
+  gg_tsresiduals()
+```
+
+
+# Procedures
+
+## PCI
+```{r, echo=FALSE, fig.height=4, fig.width=7}
+ # New tsibble with only elective admission data included
+    PCI_tsb<-PCITAVI_tsb %>%
+     summarise(., Total = sum(PCI)) 
+
+    # Automatic ARIMA/ETS to fit model
+    PCI_fit<-PCI_tsb%>%
+    slice(-n()) %>%
+    stretch_tsibble(.init = 36, .step=6)   %>%
+     model( arima= ARIMA(Total),
+            ets=ETS(Total))
+
+    
+    PCI_fit%>%
+    forecast(h = 12) %>%
+    accuracy(PCI_tsb)
+    
+    #Generate forecast numbers for table and plotting    
+       Table_PCI<-    PCI_tsb%>%
+    model( arima= ARIMA(Total)) %>%
+    forecast(h = 60) %>%
+    hilo() %>%
+  rowwise() %>%
+  mutate(across(c(`95%`), ~toString(unlist(.))))
+        
+         Table_PCI[c('Lower', 'Upper', 'PI')] <- str_split_fixed(  Table_PCI$`95%`, ',', 3)
+           
+# Table of the last 12 months of data to calculate % change
+   a <-   PCITAVI%>%
+         filter(Date >='2021-10-01' & Date <'2022-10-01') %>%
+          summarise(Total = sum(PCI)/12) 
+         
+ #Preparing table data       
+     Table_PCI <- Table_PCI%>%
+        rowwise() %>% 
+        ungroup() %>%
+         mutate(Lower=as.numeric(as.character(Lower)))%>%
+         mutate(Upper=as.numeric(as.character(Upper))) %>%
+        mutate(Month=as.Date(Month, "%Y %b"))%>%
+              dplyr::select(-.model, -`80%`,-`95%`, -Total, -PI) %>%
+           mutate(actual=NA)%>%
+         add_row(Month=NA, .mean = NA, Lower= NA, Upper=NA, actual=a$Total)%>%
+       mutate(group="PCI")
+      
+      PCI_tsb  <-   PCI_tsb %>%
+        mutate(Date=as.Date(Month, "%Y %b"))
+              
+     ggplot()+
+    geom_line(PCI_tsb, mapping=aes(x =Date, y= Total), color="black", size=1) + 
+    geom_line( Table_PCI, mapping=aes(x = Month, y= .mean), color="#5881c1", size=1) +
+  geom_ribbon( Table_PCI,mapping= aes(x= Month, ymin = Lower, ymax = Upper), fill="#5881c1", alpha = 0.3)+
+  labs( title = "PCI",y = "Number", x="")+
+  theme_bw()+
+  theme(panel.grid.major.y = element_line(color = "grey80"), panel.grid.major.x =  element_blank(), panel.grid.minor.x =  element_blank(),    panel.border = element_blank(), axis.line = element_line(colour = "black", size=1),
+        axis.text.x = element_text(size = 12), axis.text.y = element_text(size = 12), 
+        axis.title.x = element_text(size = 14), axis.title.y = element_text(size = 14,vjust=2), 
+        legend.text=element_text(size=12),legend.title=element_blank(),plot.title = element_text(size=14), legend.position= c(0.15, 0.2)) + 
+      scale_x_date(date_breaks = "3 years", date_labels = "%b-%Y")+
+  scale_y_continuous(expand = c(0, 0), limits=c(0,1500, 100)) 
+
+    
+     PCI_tsb%>%
+    model(arima=ARIMA(Total))  %>%
+  gg_tsresiduals()
+
+
+```
+
+## TAVI
+```{r, echo=FALSE, fig.height=4, fig.width=7}
+ # New tsibble with only elective admission data included
+    TAVI_tsb<-PCITAVI_tsb %>%
+     summarise(., Total = sum(TAVI)) 
+
+    # Automatic ARIMA/ETS to fit model
+    TAVI_fit<-TAVI_tsb%>%
+    slice(-n()) %>%
+    stretch_tsibble(.init = 36, .step=6)   %>%
+     model( arima= ARIMA(Total),
+            ets=ETS(Total))
+
+    TAVI_fit%>%
+    forecast(h = 12) %>%
+    accuracy(TAVI_tsb)
+    
+    
+        Table_TAVI<-    TAVI_tsb%>%
+    model( arima= ARIMA(Total)) %>%
+    forecast(h = 60) %>%
+    hilo() %>%
+  rowwise() %>%
+  mutate(across(c(`95%`), ~toString(unlist(.))))
+        
+         Table_TAVI[c('Lower', 'Upper', 'PI')] <- str_split_fixed(  Table_TAVI$`95%`, ',', 3)
+         
+         
+    # Table of the last 12 months of data to calculate % change
+   a <-   PCITAVI%>%
+         filter(Date >='2021-10-01' & Date <'2022-10-01') %>%
+          summarise(Total = sum(TAVI)/12) 
+         
+ #Preparing table data       
+     Table_TAVI <- Table_TAVI%>%
+        rowwise() %>% 
+        ungroup() %>%
+         mutate(Lower=as.numeric(as.character(Lower)))%>%
+         mutate(Upper=as.numeric(as.character(Upper))) %>%
+        mutate(Month=as.Date(Month, "%Y %b"))%>%
+              dplyr::select(-.model, -`80%`,-`95%`, -Total, -PI) %>%
+           mutate(actual=NA)%>%
+         add_row(Month=NA, .mean = NA, Lower= NA, Upper=NA, actual=a$Total)%>%
+       mutate(group="TAVI")     
+
+      
+      TAVI_tsb  <-  TAVI_tsb %>%
+        mutate(Date=as.Date(Month, "%Y %b"))
+              
+     ggplot()+
+    geom_line(TAVI_tsb, mapping=aes(x =Date, y= Total), color="black", size=1) + 
+    geom_line( Table_TAVI, mapping=aes(x = Month, y= .mean), color="#5881c1", size=1) +
+  geom_ribbon( Table_TAVI,mapping= aes(x= Month, ymin = Lower, ymax = Upper), fill="#5881c1", alpha = 0.3)+
+  labs( title = "TAVI",y = "Number", x="")+
+  theme_bw()+
+  theme(panel.grid.major.y = element_line(color = "grey80"), panel.grid.major.x =  element_blank(), panel.grid.minor.x =  element_blank(),    panel.border = element_blank(), axis.line = element_line(colour = "black", size=1),
+        axis.text.x = element_text(size = 12), axis.text.y = element_text(size = 12), 
+        axis.title.x = element_text(size = 14), axis.title.y = element_text(size = 14,vjust=2), 
+        legend.text=element_text(size=12),legend.title=element_blank(),plot.title = element_text(size=14), legend.position= c(0.15, 0.2)) + 
+      scale_x_date(date_breaks = "3 years", date_labels = "%b-%Y")+
+  scale_y_continuous(expand = c(0, 0), limits=c(0,220, 100)) 
+
+    
+    
+     TAVI_tsb%>%
+    model(arima=ARIMA(Total))  %>%
+  gg_tsresiduals()
+
+
+```
+
+## CABG
+```{r, echo=FALSE, fig.height=4, fig.width=7}
+ # New tsibble with only elective admission data included
+    CABG_tsb<-cardiacsurgery_tsb %>%
+     summarise(., Total = sum(CABG)) 
+
+    # Automatic ARIMA/ETS to fit model
+    CABG_fit<-CABG_tsb%>%
+    slice(-n()) %>%
+    stretch_tsibble(.init = 36, .step=6)   %>%
+     model( arima= ARIMA(log(Total)),
+            ets=ETS(log(Total)))
+
+    
+    CABG_fit%>%
+    forecast(h = 12) %>%
+    accuracy(CABG_tsb)
+    
+        Table_CABG<-    CABG_tsb%>%
+    model( arima= ARIMA(log(Total))) %>%
+    forecast(h = 60) %>%
+    hilo() %>%
+  rowwise() %>%
+  mutate(across(c(`95%`), ~toString(unlist(.))))
+        
+         Table_CABG[c('Lower', 'Upper', 'PI')] <- str_split_fixed(  Table_CABG$`95%`, ',', 3)
+       
+# Table of the last 12 months of data to calculate % change
+   a <-   cardiacsurgery%>%
+         filter(Date >='2021-10-01' & Date <'2022-10-01') %>%
+          summarise(Total = sum(CABG)/12) 
+         
+ #Preparing table data       
+     Table_CABG <- Table_CABG%>%
+        rowwise() %>% 
+        ungroup() %>%
+         mutate(Lower=as.numeric(as.character(Lower)))%>%
+         mutate(Upper=as.numeric(as.character(Upper))) %>%
+        mutate(Month=as.Date(Month, "%Y %b"))%>%
+              dplyr::select(-.model, -`80%`,-`95%`, -Total, -PI) %>%
+           mutate(actual=NA)%>%
+         add_row(Month=NA, .mean = NA, Lower= NA, Upper=NA, actual=a$Total)%>%
+       mutate(group="CABG")
+      
+      CABG_tsb  <-   CABG_tsb %>%
+        mutate(Date=as.Date(Month, "%Y %b"))
+              
+     ggplot()+
+    geom_line(CABG_tsb, mapping=aes(x =Date, y= Total), color="black", size=1) + 
+    geom_line( Table_CABG, mapping=aes(x = Month, y= .mean), color="#5881c1", size=1) +
+  geom_ribbon( Table_CABG,mapping= aes(x= Month, ymin = Lower, ymax = Upper), fill="#5881c1", alpha = 0.3)+
+  labs( title = "CABG",y = "Number", x="")+
+  theme_bw()+
+  theme(panel.grid.major.y = element_line(color = "grey80"), panel.grid.major.x =  element_blank(), panel.grid.minor.x =  element_blank(),    panel.border = element_blank(), axis.line = element_line(colour = "black", size=1),
+        axis.text.x = element_text(size = 12), axis.text.y = element_text(size = 12), 
+        axis.title.x = element_text(size = 14), axis.title.y = element_text(size = 14,vjust=2), 
+        legend.text=element_text(size=12),legend.title=element_blank(),plot.title = element_text(size=14), legend.position= c(0.15, 0.2)) + 
+      scale_x_date(date_breaks = "3 years", date_labels = "%b-%Y")+
+  scale_y_continuous(expand = c(0, 0), limits=c(0,400, 100)) 
+
+     
+     CABG_tsb%>%
+    model( arima= ARIMA(log(Total)))  %>%
+  gg_tsresiduals()
+
+
+```
+
+## Surgical AVR
+```{r, echo=FALSE, fig.height=4, fig.width=7}
+ # New tsibble with only elective admission data included
+    AVR_tsb<-cardiacsurgery_tsb %>%
+     summarise(., Total = sum(SurgicalAVR)) 
+
+    # Automatic ARIMA/ETS to fit model
+    AVR_fit<-AVR_tsb%>%
+    slice(-n()) %>%
+    stretch_tsibble(.init = 36, .step=6)   %>%
+     model( arima= ARIMA(log(Total)),
+            ets=ETS(log(Total)))
+
+    
+    AVR_fit%>%
+    forecast(h = 12) %>%
+    accuracy(AVR_tsb)
+    
+    Table_AVR<-    AVR_tsb%>%
+    model( arima= ARIMA(log(Total))) %>%
+    forecast(h = 60) %>%
+    hilo() %>%
+  rowwise() %>%
+  mutate(across(c(`95%`), ~toString(unlist(.))))
+        
+         Table_AVR[c('Lower', 'Upper', 'PI')] <- str_split_fixed(  Table_AVR$`95%`, ',', 3)
+       
+# Table of the last 12 months of data to calculate % change
+   a <-   cardiacsurgery%>%
+         filter(Date >='2021-10-01' & Date <'2022-10-01') %>%
+          summarise(Total = sum(SurgicalAVR)/12) 
+         
+ #Preparing table data       
+     Table_AVR <- Table_AVR%>%
+        rowwise() %>% 
+        ungroup() %>%
+         mutate(Lower=as.numeric(as.character(Lower)))%>%
+         mutate(Upper=as.numeric(as.character(Upper))) %>%
+        mutate(Month=as.Date(Month, "%Y %b"))%>%
+              dplyr::select(-.model, -`80%`,-`95%`, -Total, -PI) %>%
+           mutate(actual=NA)%>%
+         add_row(Month=NA, .mean = NA, Lower= NA, Upper=NA, actual=a$Total)%>%
+       mutate(group="Surgical AVR")
+     
+     
+      AVR_tsb  <-   AVR_tsb %>%
+        mutate(Date=as.Date(Month, "%Y %b"))
+              
+     ggplot()+
+    geom_line(AVR_tsb, mapping=aes(x =Date, y= Total), color="black", size=1) + 
+    geom_line( Table_AVR, mapping=aes(x = Month, y= .mean), color="#5881c1", size=1) +
+  geom_ribbon( Table_AVR,mapping= aes(x= Month, ymin = Lower, ymax = Upper), fill="#5881c1", alpha = 0.3)+
+  labs( title = "Surgical AVR",y = "Number", x="")+
+  theme_bw()+
+  theme(panel.grid.major.y = element_line(color = "grey80"), panel.grid.major.x =  element_blank(), panel.grid.minor.x =  element_blank(),    panel.border = element_blank(), axis.line = element_line(colour = "black", size=1),
+        axis.text.x = element_text(size = 12), axis.text.y = element_text(size = 12), 
+        axis.title.x = element_text(size = 14), axis.title.y = element_text(size = 14,vjust=2), 
+        legend.text=element_text(size=12),legend.title=element_blank(),plot.title = element_text(size=14), legend.position= c(0.15, 0.2)) + 
+      scale_x_date(date_breaks = "3 years", date_labels = "%b-%Y")+
+  scale_y_continuous(expand = c(0, 0), limits=c(0,350, 100)) 
+
+    
+     AVR_tsb%>%
+    model(arima= ARIMA(log(Total)))%>%
+  gg_tsresiduals()
+
+
+```
+
+# Providers
+
+## RJE University Hospitals of North Midlands  Total Admissions (both elective and non-elective)
+```{r, echo=FALSE, fig.height=4, fig.width=7}
+ # New tsibble 
+    RJE_tsb<-cardiacsurgery_tsb %>%
+  filter(Der_Provider_Code=="RJE") %>%
+summarise(Total = sum(Admissions_1)) 
+
+ # Automatic ARIMA/ETS to fit model
+    RJE_fit<-RJE_tsb%>%
+    slice(-n()) %>%
+    stretch_tsibble(.init = 36, .step=6)   %>%
+     model( arima= ARIMA(log(Total)),
+            ets=ETS(log(Total)))
+
+#Model predictive accuracy
+    RJE_fit%>%
+    forecast(h = 12) %>%
+    accuracy(RJE_tsb)
+    
+#Generate forecast numbers for table and plotting
+       Table_RJE<-   RJE_tsb%>%
+    model(ARIMA(log(Total))) %>%
+    forecast(h = 60) %>%
+    hilo() %>%
+  rowwise() %>%
+  mutate(across(c(`95%`), ~toString(unlist(.))))
+        
+Table_RJE[c('Lower', 'Upper', 'PI')] <- str_split_fixed(  Table_RJE$`95%`, ',', 3)
+         
+# Table of the last 12 months of data to calculate % change
+   a <-   cardiacsurgery%>%
+          filter(Der_Provider_Code=="RJE") %>%
+         filter(Date >='2021-10-01' & Date <'2022-10-01') %>%
+          summarise(Total = sum(Admissions_1)/12) 
+    
+#Preparing table data            
+     Table_RJE <- Table_RJE%>%
+    rowwise() %>% 
+        ungroup() %>%
+         mutate(Lower=as.numeric(as.character(Lower)))%>%
+         mutate(Upper=as.numeric(as.character(Upper))) %>%
+        mutate(Month=as.Date(Month, "%Y %b"))%>%
+              dplyr::select(-.model, -`80%`,-`95%`, -Total, -PI) %>%
+           mutate(actual=NA)%>%
+         add_row(Month=NA, .mean = NA, Lower= NA, Upper=NA, actual=a$Total)%>%
+       mutate(group="University Hospitals of North Midlands")
+      
+      RJE_tsb  <-   RJE_tsb %>%
+        mutate(Date=as.Date(Month, "%Y %b"))
+     
+#Plotting forecast           
+ggplot()+
+    geom_line(RJE_tsb, mapping=aes(x =Date, y= Total), color="black", size=1) + 
+    geom_line( Table_RJE, mapping=aes(x = Month, y= .mean), color="#5881c1", size=1) +
+  geom_ribbon( Table_RJE,mapping= aes(x= Month, ymin = Lower, ymax = Upper), fill="#5881c1", alpha = 0.3)+
+  labs( title = "University Hospitals of North Midlands",y = "Number", x="")+
+  theme_bw()+
+  theme(panel.grid.major.y = element_line(color = "grey80"), panel.grid.major.x =  element_blank(), panel.grid.minor.x =  element_blank(),    panel.border = element_blank(), axis.line = element_line(colour = "black", size=1),
+        axis.text.x = element_text(size = 12), axis.text.y = element_text(size = 12), 
+        axis.title.x = element_text(size = 14), axis.title.y = element_text(size = 14,vjust=2), 
+        legend.text=element_text(size=12),legend.title=element_blank(),plot.title = element_text(size=14), legend.position= c(0.15, 0.2)) + 
+      scale_x_date(date_breaks = "3 years", date_labels = "%b-%Y")+
+  scale_y_continuous(expand = c(0, 0), limits=c(0,140, 100)) 
+
+#Checking residuals
+     RJE_tsb%>%
+    model(arima=ARIMA(log(Total)))  %>%
+  gg_tsresiduals()
+
+
+```
+
+## RKB University Hospitals Coventry & Warwickshire Total Admissions (both elective and non-elective)
+Need to log transform to stop going negative
+```{r, echo=FALSE, fig.height=4, fig.width=7}
+
+RKB_tsb<-cardiacsurgery_tsb %>%
+  filter(Der_Provider_Code=="RKB") %>%
+summarise(Total = sum(Admissions_1)) 
+
+# Automatic ARIMA/ETS to fit model
+    RKB_fit<-RKB_tsb%>%
+    slice(-n()) %>%
+    stretch_tsibble(.init = 36, .step=6)   %>%
+     model( arima= ARIMA(log(Total)),
+            ets=ETS(log(Total)))
+
+ #Model predictive accuracy
+    RKB_fit%>%
+    forecast(h = 12) %>%
+    accuracy(RKB_tsb)
+    
+#Generate forecast numbers for table and plotting
+       Table_RKB<-  RKB_tsb%>%
+    model( arima= ARIMA(log(Total))) %>%
+    forecast(h = 60) %>%
+    hilo() %>%
+  rowwise() %>%
+  mutate(across(c(`95%`), ~toString(unlist(.))))
+        
+Table_RKB[c('Lower', 'Upper', 'PI')] <- str_split_fixed(  Table_RKB$`95%`, ',', 3)
+      
+# Table of the last 12 months of data to calculate % change     
+                a <-   cardiacsurgery%>%
+  filter(Der_Provider_Code=="RKB") %>%
+         filter(Date >='2021-10-01' & Date <'2022-10-01') %>%
+summarise(Total = sum(Admissions_1)/12) 
+       
+ #Preparing table data                  
+     Table_RKB <- Table_RKB%>%
+         rowwise() %>% 
+        ungroup() %>%
+         mutate(Lower=as.numeric(as.character(Lower)))%>%
+         mutate(Upper=as.numeric(as.character(Upper))) %>%
+        mutate(Month=as.Date(Month, "%Y %b"))%>%
+              dplyr::select(-.model, -`80%`,-`95%`, -Total, -PI) %>%
+           mutate(actual=NA)%>%
+         add_row(Month=NA, .mean = NA, Lower= NA, Upper=NA, actual=a$Total)%>%
+       mutate(group="University Hospitals Coventry & Warwickshire")
+      
+      RKB_tsb  <-   RKB_tsb %>%
+        mutate(Date=as.Date(Month, "%Y %b"))
+              
+     ggplot()+
+    geom_line(RKB_tsb, mapping=aes(x =Date, y= Total), color="black", size=1) + 
+    geom_line( Table_RKB, mapping=aes(x = Month, y= .mean), color="#5881c1", size=1) +
+  geom_ribbon( Table_RKB,mapping= aes(x= Month, ymin = Lower, ymax = Upper), fill="#5881c1", alpha = 0.3)+
+  labs( title = "University Hospitals Coventry & Warwickshire",y = "Number", x="")+
+  theme_bw()+
+  theme(panel.grid.major.y = element_line(color = "grey80"), panel.grid.major.x =  element_blank(), panel.grid.minor.x =  element_blank(),    panel.border = element_blank(), axis.line = element_line(colour = "black", size=1),
+        axis.text.x = element_text(size = 12), axis.text.y = element_text(size = 12), 
+        axis.title.x = element_text(size = 14), axis.title.y = element_text(size = 14,vjust=2), 
+        legend.text=element_text(size=12),legend.title=element_blank(),plot.title = element_text(size=14), legend.position= c(0.15, 0.2)) + 
+      scale_x_date(date_breaks = "3 years", date_labels = "%b-%Y")+
+  scale_y_continuous(expand = c(0, 0), limits=c(0,120, 100)) 
+
+ #Checking residuals   
+     RKB_tsb%>%
+    model(arima=ARIMA(log(Total)))  %>%
+  gg_tsresiduals()
+
+
+```
+
+## RL4 The Royal Wolverhampton Total Admissions (both elective and non-elective)
+
+```{r, echo=FALSE, fig.height=4, fig.width=7}
+
+RL4_tsb<-cardiacsurgery_tsb %>%
+  filter(Der_Provider_Code=="RL4") %>%
+summarise(Total = sum(Admissions_1)) 
+
+# Automatic ARIMA/ETS to fit model
+    RL4_fit<-RL4_tsb%>%
+    slice(-n()) %>%
+    stretch_tsibble(.init = 36, .step=6)   %>%
+     model( arima= ARIMA(Total),
+            ets=ETS(Total))
+
+ #Model predictive accuracy
+    RL4_fit%>%
+    forecast(h = 12) %>%
+    accuracy(RL4_tsb)
+    
+#Generate forecast numbers for table and plotting
+       Table_RL4<-  RL4_tsb%>%
+    model( arima= ARIMA(Total)) %>%
+    forecast(h = 60) %>%
+    hilo() %>%
+  rowwise() %>%
+  mutate(across(c(`95%`), ~toString(unlist(.))))
+        
+Table_RL4[c('Lower', 'Upper', 'PI')] <- str_split_fixed(  Table_RL4$`95%`, ',', 3)
+    
+# Table of the last 12 months of data to calculate % change           
+                a <-   cardiacsurgery%>%
+  filter(Der_Provider_Code=="RL4") %>%
+         filter(Date >='2021-10-01' & Date <'2022-10-01') %>%
+summarise(Total = sum(Admissions_1)/12) 
+                
+#Preparing table data        
+     Table_RL4 <- Table_RL4%>%
+    rowwise() %>% 
+        ungroup() %>%
+         mutate(Lower=as.numeric(as.character(Lower)))%>%
+         mutate(Upper=as.numeric(as.character(Upper))) %>%
+        mutate(Month=as.Date(Month, "%Y %b"))%>%
+              dplyr::select(-.model, -`80%`,-`95%`, -Total, -PI) %>%
+           mutate(actual=NA)%>%
+         add_row(Month=NA, .mean = NA, Lower= NA, Upper=NA, actual=a$Total)%>%
+       mutate(group="The Royal Wolverhampton")
+      
+      RL4_tsb  <-   RL4_tsb %>%
+        mutate(Date=as.Date(Month, "%Y %b"))
+              
+     ggplot()+
+    geom_line(RL4_tsb, mapping=aes(x =Date, y= Total), color="black", size=1) + 
+    geom_line( Table_RL4, mapping=aes(x = Month, y= .mean), color="#5881c1", size=1) +
+  geom_ribbon( Table_RL4,mapping= aes(x= Month, ymin = Lower, ymax = Upper), fill="#5881c1", alpha = 0.3)+
+  labs( title = "The Royal Wolverhampton",y = "Number", x="")+
+  theme_bw()+
+  theme(panel.grid.major.y = element_line(color = "grey80"), panel.grid.major.x =  element_blank(), panel.grid.minor.x =  element_blank(),    panel.border = element_blank(), axis.line = element_line(colour = "black", size=1),
+        axis.text.x = element_text(size = 12), axis.text.y = element_text(size = 12), 
+        axis.title.x = element_text(size = 14), axis.title.y = element_text(size = 14,vjust=2), 
+        legend.text=element_text(size=12),legend.title=element_blank(),plot.title = element_text(size=14), legend.position= c(0.15, 0.2)) + 
+      scale_x_date(date_breaks = "3 years", date_labels = "%b-%Y")+
+  scale_y_continuous(expand = c(0, 0), limits=c(0,100, 100)) 
+
+#Checking residuals    
+     RL4_tsb%>%
+    model(arima=ARIMA(Total))  %>%
+  gg_tsresiduals()
+
+```
+## RRK University Hospitals Birmingham  Total Admissions (both elective and non-elective)
+Need to log to stop values going negative
+```{r, echo=FALSE, fig.height=4, fig.width=7}
+
+RRK_tsb<-cardiacsurgery_tsb %>%
+  filter(Der_Provider_Code=="RRK") %>%
+summarise(Total = sum(Admissions_1)) 
+
+ # Automatic ARIMA/ETS to fit model
+    RRK_fit<-RRK_tsb%>%
+    slice(-n()) %>%
+    stretch_tsibble(.init = 36, .step=6)   %>%
+     model( arima= ARIMA(log(Total)),
+            ets=ETS(log(Total)))
+
+#Model predictive accuracy
+    RRK_fit%>%
+    forecast(h = 12) %>%
+    accuracy(RRK_tsb)
+    
+ #Generate forecast numbers for table and plotting
+       Table_RRK<- RRK_tsb%>%
+    model( arima= ARIMA(log(Total))) %>%
+    forecast(h = 60) %>%
+    hilo() %>%
+  rowwise() %>%
+  mutate(across(c(`95%`), ~toString(unlist(.))))
+
+  Table_RRK[c('Lower', 'Upper', 'PI')] <- str_split_fixed(  Table_RRK$`95%`, ',', 3)
+        
+         
+# Table of the last 12 months of data to calculate % change      
+                a <-   cardiacsurgery%>%
+  filter(Der_Provider_Code=="RRK") %>%
+         filter(Date >='2021-10-01' & Date <'2022-10-01') %>%
+summarise(Total = sum(Admissions_1)/12) 
+       
+#Preparing table data                  
+     Table_RRK <- Table_RRK%>%
+          rowwise() %>% 
+        ungroup() %>%
+         mutate(Lower=as.numeric(as.character(Lower)))%>%
+         mutate(Upper=as.numeric(as.character(Upper))) %>%
+        mutate(Month=as.Date(Month, "%Y %b"))%>%
+              dplyr::select(-.model, -`80%`,-`95%`, -Total, -PI) %>%
+           mutate(actual=NA)%>%
+         add_row(Month=NA, .mean = NA, Lower= NA, Upper=NA, actual=a$Total)%>%
+       mutate(group="University Hospitals Birmingham")
+      
+      RRK_tsb  <-   RRK_tsb %>%
+        mutate(Date=as.Date(Month, "%Y %b"))
+              
+ ggplot()+
+    geom_line(RRK_tsb, mapping=aes(x =Date, y= Total), color="black", size=1) + 
+    geom_line( Table_RRK, mapping=aes(x = Month, y= .mean), color="#5881c1", size=1) +
+  geom_ribbon( Table_RRK,mapping= aes(x= Month, ymin = Lower, ymax = Upper), fill="#5881c1", alpha = 0.3)+
+  labs( title = "University Hospitals Birmingham",y = "Number", x="")+
+  theme_bw()+
+  theme(panel.grid.major.y = element_line(color = "grey80"), panel.grid.major.x =  element_blank(), panel.grid.minor.x =  element_blank(),    panel.border = element_blank(), axis.line = element_line(colour = "black", size=1),
+        axis.text.x = element_text(size = 12), axis.text.y = element_text(size = 12), 
+        axis.title.x = element_text(size = 14), axis.title.y = element_text(size = 14,vjust=2), 
+        legend.text=element_text(size=12),legend.title=element_blank(),plot.title = element_text(size=14), legend.position= c(0.15, 0.2)) + 
+      scale_x_date(date_breaks = "3 years", date_labels = "%b-%Y")+
+  scale_y_continuous(expand = c(0, 0), limits=c(0,120, 100)) 
+
+ #Checking residuals   
+     RRK_tsb%>%
+    model(arima=ARIMA(log(Total)))  %>%
+  gg_tsresiduals()
+```
+
+
+## RWE University Hospitals of Leicester Total Admissions (both elective and non-elective)
+
+```{r, echo=FALSE, fig.height=4, fig.width=7}
+
+RWE_tsb<-cardiacsurgery_tsb %>%
+  filter(Der_Provider_Code=="RWE") %>%
+summarise(Total = sum(Admissions_1)) 
+
+# Automatic ARIMA/ETS to fit model
+    RWE_fit<-RWE_tsb%>%
+    slice(-n()) %>%
+    stretch_tsibble(.init = 36, .step=6)   %>%
+     model( arima= ARIMA(Total),
+            ets=ETS(Total))
+
+#Model predictive accuracy
+    RWE_fit%>%
+    forecast(h = 12) %>%
+    accuracy(RWE_tsb)
+    
+#Generate forecast numbers for table and plotting
+       Table_RWE<- RWE_tsb%>%
+    model( arima= ARIMA(Total))%>%
+    forecast(h = 60) %>%
+    hilo() %>%
+  rowwise() %>%
+  mutate(across(c(`95%`), ~toString(unlist(.))))
+        
+Table_RWE[c('Lower', 'Upper', 'PI')] <- str_split_fixed(  Table_RWE$`95%`, ',', 3)
+         
+ # Table of the last 12 months of data to calculate % change      
+                a <-   cardiacsurgery%>%
+  filter(Der_Provider_Code=="RWE") %>%
+         filter(Date >='2021-10-01' & Date <'2022-10-01') %>%
+summarise(Total = sum(Admissions_1)/12) 
+       
+#Preparing table data                   
+     Table_RWE<- Table_RWE%>%
+   rowwise() %>% 
+        ungroup() %>%
+         mutate(Lower=as.numeric(as.character(Lower)))%>%
+         mutate(Upper=as.numeric(as.character(Upper))) %>%
+        mutate(Month=as.Date(Month, "%Y %b"))%>%
+              dplyr::select(-.model, -`80%`,-`95%`, -Total, -PI) %>%
+           mutate(actual=NA)%>%
+         add_row(Month=NA, .mean = NA, Lower= NA, Upper=NA, actual=a$Total)%>%
+            mutate(group= "University Hospitals of Leicester")
+            
+      RWE_tsb  <-   RWE_tsb %>%
+        mutate(Date=as.Date(Month, "%Y %b"))
+              
+    ggplot()+
+    geom_line(RWE_tsb, mapping=aes(x =Date, y= Total), color="black", size=1) + 
+    geom_line( Table_RWE, mapping=aes(x = Month, y= .mean), color="#5881c1", size=1) +
+  geom_ribbon( Table_RWE,mapping= aes(x= Month, ymin = Lower, ymax = Upper), fill="#5881c1", alpha = 0.3)+
+  labs( title = "University Hospitals of Leicester",y = "Number", x="")+
+  theme_bw()+
+  theme(panel.grid.major.y = element_line(color = "grey80"), panel.grid.major.x =  element_blank(), panel.grid.minor.x =  element_blank(),    panel.border = element_blank(), axis.line = element_line(colour = "black", size=1),
+        axis.text.x = element_text(size = 12), axis.text.y = element_text(size = 12), 
+        axis.title.x = element_text(size = 14), axis.title.y = element_text(size = 14,vjust=2), 
+        legend.text=element_text(size=12),legend.title=element_blank(),plot.title = element_text(size=14), legend.position= c(0.15, 0.2)) + 
+      scale_x_date(date_breaks = "3 years", date_labels = "%b-%Y")+
+  scale_y_continuous(expand = c(0, 0), limits=c(0,140, 100)) 
+
+#Checking residuals    
+     RWE_tsb%>%
+    model(arima=ARIMA(Total))  %>%
+  gg_tsresiduals()
+
+
+```
+
+
+## RX1 Nottingham University Hospitals Total Admissions (both elective and non-elective)
+
+```{r, echo=FALSE, fig.height=4, fig.width=7}
+
+RX1_tsb<-cardiacsurgery_tsb %>%
+  filter(Der_Provider_Code=="RX1") %>%
+summarise(Total = sum(Admissions_1)) 
+
+
+  # Automatic ARIMA/ETS to fit model
+    RX1_fit<-RX1_tsb%>%
+    slice(-n()) %>%
+    stretch_tsibble(.init = 36, .step=6)   %>%
+     model( arima= (ARIMA(Total)),
+            ets=ETS(Total))
+
+ #Model predictive accuracy
+    RX1_fit%>%
+    forecast(h = 12) %>%
+    accuracy(RX1_tsb)
+    
+#Generate forecast numbers for table and plotting
+       Table_RX1<- RX1_tsb%>%
+    model( arima= ARIMA(Total))%>%
+    forecast(h = 60) %>%
+    hilo() %>%
+  rowwise() %>%
+  mutate(across(c(`95%`), ~toString(unlist(.))))
+        
+Table_RX1[c('Lower', 'Upper', 'PI')] <- str_split_fixed(  Table_RX1$`95%`, ',', 3)
+         
+          
+ RX1_tsb  <-   RX1_tsb %>%
+        mutate(Date=as.Date(Month, "%Y %b"))
+
+ # Table of the last 12 months of data to calculate % change
+       a <-   cardiacsurgery%>%
+  filter(Der_Provider_Code=="RX1") %>%
+         filter(Date >='2021-10-01' & Date <'2022-10-01') %>%
+summarise(Total = sum(Admissions_1)/12) 
+       
+       
+ #Preparing table data           
+     Table_RX1<-Table_RX1%>%
+       rowwise() %>% 
+        ungroup() %>%
+         mutate(Lower=as.numeric(as.character(Lower)))%>%
+         mutate(Upper=as.numeric(as.character(Upper))) %>%
+        mutate(Month=as.Date(Month, "%Y %b"))%>%
+        dplyr::select(-.model, -`80%`,-`95%`, -Total, -PI) %>%
+       mutate(actual=NA)%>%
+         add_row(Month=NA, .mean = NA, Lower= NA, Upper=NA, actual=a$Total)%>%
+       mutate(group="Nottingham University Hospitals")
+
+              
+     ggplot()+
+    geom_line(RX1_tsb, mapping=aes(x =Date, y= Total), color="black", size=1) + 
+    geom_line( Table_RX1, mapping=aes(x = Month, y= .mean), color="#5881c1", size=1) +
+  geom_ribbon( Table_RX1,mapping= aes(x= Month, ymin = Lower, ymax = Upper), fill="#5881c1", alpha = 0.3)+
+  labs( title = "Nottingham University Hospitals",y = "Number", x="")+
+  theme_bw()+
+  theme(panel.grid.major.y = element_line(color = "grey80"), panel.grid.major.x =  element_blank(), panel.grid.minor.x =  element_blank(),    panel.border = element_blank(), axis.line = element_line(colour = "black", size=1),
+        axis.text.x = element_text(size = 12), axis.text.y = element_text(size = 12), 
+        axis.title.x = element_text(size = 14), axis.title.y = element_text(size = 14,vjust=2), 
+        legend.text=element_text(size=12),legend.title=element_blank(),plot.title = element_text(size=14), legend.position= c(0.15, 0.2)) + 
+      scale_x_date(date_breaks = "3 years", date_labels = "%b-%Y")+
+  scale_y_continuous(expand = c(0, 0), limits=c(0,70, 100)) 
+
+#Checking residuals    
+     RX1_tsb%>%
+    model(arima=ARIMA(Total))  %>%
+  gg_tsresiduals()
+
+```
+#Tables
+
+
+## Admissions
+
+```{r, echo=FALSE, fig.height=4, fig.width=6}
+
+Summarytable_Admissions<-rbind(Table_ElectiveAdmit, Table_NonElectiveAdmit, Table_TotalAdmit)%>%
+  mutate(.,Date=ifelse((is.na(Month)), "Oct 21-Sept 22", ifelse((Month >='2022-10-01' & Month <'2023-10-01'), "Oct 22-Sept 23", ifelse((Month >='2023-10-01' & Month <'2024-10-01'), "Oct 23-Sept 24", ifelse((Month >='2024-10-01' & Month <'2025-10-01'), "Oct 24-Sept 25", ifelse((Month >='2025-10-01' & Month <'2026-10-01'), "Oct 25-Sept 26", ifelse((Month >='2026-10-01' & Month <'2027-10-01'), "Oct 26-Sept 27", ""))))))) %>%
+  group_by(Date, group)%>%
+  summarise(.mean=round(mean(.mean),0), actual=round(mean(actual),0), Lower=round(min(Lower),0),  Upper=round(max(Upper),0))%>%
+    ungroup() %>%
+    mutate(`% change`=ifelse(group=="Elective Admissions", ((.mean-actual[1])/actual[1])*100, ifelse(group=="Non-Elective Admissions", ((.mean-actual[2])/actual[2])*100, ifelse(group=="Total Admissions", ((.mean-actual[3])/actual[3])*100, "")))) %>%
+  mutate(Value= ifelse(!is.na(actual), actual, paste0(.mean, " (",Lower, "-", Upper,")"))) %>%
+  select(-.mean, -Lower, -Upper, -actual)%>%
+  mutate(`% change`=round(as.numeric(`% change`),1))%>%
+    mutate(`% change`=ifelse(Date== "Oct 21-Sept 22", NA,`% change` ) )%>%
+  pivot_wider(names_from = group, values_from = c(Value, `% change`)) 
+
+Summarytable_Admissions <- Summarytable_Admissions[, c(1,2,5, 3, 6, 4, 7)]
+
+
+
+
+#Admission Table Output 
+
+AdmissionsTable<- flextable(Summarytable_Admissions)%>%
+align(., align = "center")  %>%
+  set_header_labels(.,
+     Date="",
+    `Value_Elective Admissions`="Number (95% CI)",
+     `% change_Elective Admissions`="% change",
+    `Value_Non-Elective Admissions`= "Number (95% CI) ",
+    `% change_Non-Elective Admissions`= "% change",
+    `Value_Total Admissions`= "Number (95% CI)",  
+    `% change_Total Admissions`= "% change") %>%
+ add_header_row(values = c("", "Elective Admissions", "Non-Elective Admissions", "Total Admissions"), colwidths = c(1,2,2,2)) %>% 
+  align(., i = 1, part = "header", align = "center")%>% 
+ align(., i = 2, part = "header", align = "center") %>% 
+hline(.,  i = 1, part = "header", border=fp_border(color="#f9bf07")) %>%
+    vline(., i = 1, j=1, fp_border(color="white"), part="body")%>%
+  bg(., bg = "#f9bf07", part = "header")  %>%
+  set_caption(., "Summary of Predicted Monthly Admissions for Cardiac Procedures",  style = "Table Caption")%>%
+  hline_bottom (.,  border = fp_border(color="black", width = 2))%>%
+  hline_top(., part="all", border = fp_border(color="black", width = 2))%>%
+  bold(., i = 1, bold = TRUE)%>%
+  bold(., i = 1, bold = TRUE, part="header")%>%
+  add_footer_lines(.,values = c("% change relative to Oct 21-Sept 22")) %>%
+  autofit()%>% fit_to_width(8)
+
+
+AdmissionsTable
+
+save_as_docx(AdmissionsTable, path = "AdmissionsTable.docx")
+```
+
+## Length of Stay
+
+```{r, echo=FALSE, fig.height=4, fig.width=7}
+
+Summarytable_LOS<-rbind(Table_ElectiveLOS, Table_NonElectiveLOS,  Table_TotalLOS)%>%
+   mutate(.,Date=ifelse((is.na(Month)), "Oct 21-Sept 22", ifelse((Month >='2022-10-01' & Month <'2023-10-01'), "Oct 22-Sept 23", ifelse((Month >='2023-10-01' & Month <'2024-10-01'), "Oct 23-Sept 24", ifelse((Month >='2024-10-01' & Month <'2025-10-01'), "Oct 24-Sept 25", ifelse((Month >='2025-10-01' & Month <'2026-10-01'), "Oct 25-Sept 26", ifelse((Month >='2026-10-01' & Month <'2027-10-01'), "Oct 26-Sept 27", ""))))))) %>%
+  group_by(Date, group)%>%
+  summarise(.mean=round(mean(.mean),1), actual=round(mean(actual),1), Lower=round(min(Lower),1),  Upper=round(max(Upper),0))%>%
+    ungroup() %>%
+    mutate(`% change`=ifelse(group=="Mean Elective LOS", ((.mean-actual[1])/actual[1])*100, ifelse(group=="Mean Non-Elective LOS", ((.mean-actual[2])/actual[2])*100, ifelse(group=="Mean Total LOS", ((.mean-actual[3])/actual[3])*100, ""))))%>%
+  mutate(Value= ifelse(!is.na(actual), actual, paste0(.mean, " (",Lower, "-", Upper,")"))) %>%
+  select(-.mean, -Lower, -Upper, -actual)%>%
+  mutate(`% change`=round(as.numeric(`% change`),1))%>%
+    mutate(`% change`=ifelse(Date== "Oct 21-Sept 22", NA,`% change` ) )%>%
+  pivot_wider(names_from = group, values_from = c(Value, `% change`)) 
+
+Summarytable_LOS <- Summarytable_LOS[, c(1,2, 5, 3, 6, 4,7)]
+
+#LOS Table Output 
+
+LOSTable<-flextable(Summarytable_LOS)%>%
+align(., align = "center")  %>%
+  set_header_labels(.,
+    Date ="",
+      `Value_Mean Elective LOS`="Number (95% CI)",
+     `% change_Mean Elective LOS`="% change",
+    `Value_Mean Non-Elective LOS`= "Number (95% CI) ",
+    `% change_Mean Non-Elective LOS`= "% change",
+    `Value_Mean Total LOS`= "Number (95% CI)",  
+    `% change_Mean Total LOS`= "% change") %>%
+ add_header_row(values = c("",  "Mean Elective LOS", "Mean Non-Elective LOS", "Mean Total LOS"), colwidths = c(1,2,2,2)) %>% 
+  align(., i = 1, part = "header", align = "center")%>% 
+ align(., i = 2, part = "header", align = "center") %>% 
+hline(.,  i = 1, part = "header", border=fp_border(color="#f9bf07")) %>%
+    vline(., i = 1, j=1, fp_border(color="white"), part="body")%>%
+  bg(., bg = "#f9bf07", part = "header")  %>%
+  set_caption(., "Summary of Predicted Monthly Admissions for Cardiac Procedures at each Provider",  style = "Table Caption")%>%
+  hline_bottom (.,  border = fp_border(color="black", width = 2))%>%
+  hline_top(., part="all", border = fp_border(color="black", width = 2))%>%
+  bold(., i = 1, bold = TRUE)%>%
+    bold(., i = 1, bold = TRUE, part="header")%>%
+  add_footer_lines(.,values = c("% change relative to Oct 21-Sept 22")) %>%
+  autofit()
+
+
+
+LOSTable
+
+
+save_as_docx(LOSTable, path = "LOSTable.docx")
+```
+
+## By provider
+
+```{r}
+
+Summarytable_Providers<-rbind(Table_RJE, Table_RKB, Table_RL4, Table_RRK, Table_RWE, Table_RX1)%>%
+   mutate(.,Date=ifelse((is.na(Month)), "Oct 21-Sept 22", ifelse((Month >='2022-10-01' & Month <'2023-10-01'), "Oct 22-Sept 23", ifelse((Month >='2023-10-01' & Month <'2024-10-01'), "Oct 23-Sept 24", ifelse((Month >='2024-10-01' & Month <'2025-10-01'), "Oct 24-Sept 25", ifelse((Month >='2025-10-01' & Month <'2026-10-01'), "Oct 25-Sept 26", ifelse((Month >='2026-10-01' & Month <'2027-10-01'), "Oct 26-Sept 27", ""))))))) %>%
+  group_by(Date, group)%>%
+  summarise(.mean=round(mean(.mean),0), actual=round(mean(actual),0), Lower=round(min(Lower),0),  Upper=round(max(Upper),0))%>%
+    ungroup() %>%
+    mutate(`% change`=ifelse(group=="Nottingham University Hospitals", ((.mean-actual[1])/actual[1])*100, ifelse(group=="The Royal Wolverhampton", ((.mean-actual[2])/actual[2])*100, ifelse(group=="University Hospitals Birmingham", ((.mean-actual[3])/actual[3])*100, ifelse(group=="University Hospitals Coventry & Warwickshire", ((.mean-actual[4])/actual[4])*100, ifelse(group=="University Hospitals of Leicester", ((.mean-actual[5])/actual[5])*100, ifelse(group=="University Hospitals of North Midlands", ((.mean-actual[6])/actual[6])*100, ""))))))) %>%
+  mutate(Value= ifelse(!is.na(actual), actual, paste0(.mean, " (",Lower, "-", Upper,")"))) %>%
+  select(-.mean, -Lower, -Upper, -actual)%>%
+  mutate(`% change`=round(as.numeric(`% change`),1))%>%
+    mutate(`% change`=ifelse(Date== "Oct 21-Sept 22", NA,`% change` ) )%>%
+  pivot_wider(names_from = group, values_from = c(Value, `% change`)) 
+
+Summarytable_Providers <- Summarytable_Providers[, c(1,2, 8, 3, 9, 4,10,5,11,6,12,7,13)]
+
+#Admission Table Output 
+
+ProviderTable<-  flextable(Summarytable_Providers)%>%
+align(., align = "center")  %>%
+  set_header_labels(.,
+  Date ="",
+    `Value_Nottingham University Hospitals`="No. (95% CI)",
+     `% change_Nottingham University Hospitals`="% change",
+    `Value_The Royal Wolverhampton`= "No. (95% CI)",
+    `% change_The Royal Wolverhampton`= "% change",
+    `Value_University Hospitals Birmingham`= "No. (95% CI)", 
+    `% change_University Hospitals Birmingham`= "% change",
+      `Value_University Hospitals Coventry & Warwickshire`="No. (95% CI)",
+     `% change_University Hospitals Coventry & Warwickshire`="% change",
+    `Value_University Hospitals of Leicester`= "No. (95% CI)",
+    `% change_University Hospitals of Leicester`= "% change",
+    `Value_University Hospitals of North Midlands`= "No. (95% CI)",
+    `% change_University Hospitals of North Midlands`= "% change") %>%
+ add_header_row(values = c("", "Nottingham University Hospitals", "The Royal Wolverhampton", "University Hospitals Birmingham","University Hospitals Coventry & Warwickshire", "University Hospitals of Leicester", "University Hospitals of North Midlands"), colwidths = c(1,2,2,2,2,2,2)) %>% 
+  align(., i = 1, part = "header", align = "center")%>% 
+ align(., i = 2, part = "header", align = "center") %>% 
+hline(.,  i = 1, part = "header", border=fp_border(color="#f9bf07")) %>%
+    vline(., i = 1, j=1, fp_border(color="white"), part="body")%>%
+  bg(., bg = "#f9bf07", part = "header")  %>%
+  set_caption(., "Summary of Predicted Monthly Admissions for Cardiac Procedures at each Provider",  style = "Table Caption")%>%
+  hline_bottom (.,  border = fp_border(color="black", width = 2))%>%
+  hline_top(., part="all", border = fp_border(color="black", width = 2))%>%
+  bold(., i = 1, bold = TRUE)%>%
+    bold(., i = 1, bold = TRUE, part="header")%>%
+  add_footer_lines(.,values = c("% change relative to Oct 21-Sept 22")) %>%
+  autofit()
+
+
+ProviderTable
+
+save_as_docx(ProviderTable, path = "ProviderTable.docx")
+
+
+```
+
+## Procedure
+
+```{r, echo=FALSE, fig.height=4, fig.width=7}
+
+Summarytable_Procedure<-rbind(Table_AVR, Table_TAVI, Table_CABG, Table_PCI)%>%
+   mutate(.,Date=ifelse((is.na(Month)), "Oct 21-Sept 22", ifelse((Month >='2022-10-01' & Month <'2023-10-01'), "Oct 22-Sept 23", ifelse((Month >='2023-10-01' & Month <'2024-10-01'), "Oct 23-Sept 24", ifelse((Month >='2024-10-01' & Month <'2025-10-01'), "Oct 24-Sept 25", ifelse((Month >='2025-10-01' & Month <'2026-10-01'), "Oct 25-Sept 26", ifelse((Month >='2026-10-01' & Month <'2027-10-01'), "Oct 26-Sept 27", ""))))))) %>%
+  group_by(Date, group)%>%
+  summarise(.mean=round(mean(.mean),0), actual=round(mean(actual),0), Lower=round(min(Lower),0),  Upper=round(max(Upper),0))%>%
+    ungroup() %>%
+    mutate(`% change`=ifelse(group=="CABG", ((.mean-actual[1])/actual[1])*100, ifelse(group=="PCI", ((.mean-actual[2])/actual[2])*100, ifelse(group=="Surgical AVR", ((.mean-actual[3])/actual[3])*100, ifelse(group=="TAVI", ((.mean-actual[4])/actual[4])*100, ""))))) %>%
+  mutate(Value= ifelse(!is.na(actual), actual, paste0(.mean, " (",Lower, "-", Upper,")"))) %>%
+  select(-.mean, -Lower, -Upper, -actual)%>%
+  mutate(`% change`=round(as.numeric(`% change`),1))%>%
+    mutate(`% change`=ifelse(Date== "Oct 21-Sept 22", NA,`% change` ) )%>%
+  pivot_wider(names_from = group, values_from = c(Value, `% change`)) 
+
+Summarytable_Procedure <- Summarytable_Procedure[, c(1,4, 8, 5, 9, 2,6,3,7)]
+
+
+
+
+#Admission Table Output 
+
+ProcedureTable<-flextable(Summarytable_Procedure)%>%
+align(., align = "center")  %>%
+  set_header_labels(.,
+    Quarter ="",
+    `Value_Coronary Artery Bypass Graft`= "No. (95% CI)",
+    `% change_Coronary Artery Bypass Graft`= "% change",
+    `Value_Percutaneous Coronary Intervention`= "No. (95% CI)", 
+    `% change_Percutaneous Coronary Intervention`= "% change",
+      `Value_Surgical AVR`="No. (95% CI)",
+     `% change_Surgical AVR`="% change",
+    `Value_TAVI`= "No. (95% CI)",
+    `% change_TAVI`= "% change") %>%
+ add_header_row(values = c("", "Surgical AVR", "TAVI", "CABG", "PCI"), colwidths = c(1,2,2,2,2)) %>% 
+  align(., i = 1, part = "header", align = "center")%>% 
+ align(., i = 2, part = "header", align = "center") %>% 
+hline(.,  i = 1, part = "header", border=fp_border(color="#f9bf07")) %>%
+    vline(., i = 1, j=1, fp_border(color="white"), part="body")%>%
+  bg(., bg = "#f9bf07", part = "header")  %>%
+  set_caption(., "Summary of Predicted Monthly Admissions for Cardiac Procedures at each Provider",  style = "Table Caption")%>%
+ hline_bottom (.,  border = fp_border(color="black", width = 2))%>%
+  hline_top(., part="all", border = fp_border(color="black", width = 2))%>%
+  bold(., i = 1, bold = TRUE)%>%
+    bold(., i = 1, bold = TRUE, part="header")%>%
+  add_footer_lines(.,values = c("% change relative to Oct 21-Sept 22")) %>%
+  autofit()
+
+
+ProcedureTable
+
+
+save_as_docx(ProcedureTable, path = "ProcedureTable.docx")
+```
+
