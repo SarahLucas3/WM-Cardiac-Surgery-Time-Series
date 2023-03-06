@@ -159,7 +159,7 @@ summarise(Total = sum(Admissions_1)/n_distinct(adm_month)) %>%
 ggplot(aes(x =  adm_year, y =Total)) + 
   geom_line(color="blue", size=1)  + 
   geom_point(color="blue", size=2)+
-  labs( title = "Average monthly admissions by year",y = "Monthly number", x="")+
+  labs( title = "Average monthly elective admissions by year",y = "Monthly number", x="")+
   theme_bw()+
   theme(panel.grid.major.y = element_line(color = "grey80"), panel.grid.major.x =  element_blank(), panel.grid.minor.x =  element_blank(), panel.border = element_blank(), axis.line = element_line(colour = "black", size=1),
         axis.text.x = element_text(size = 12), axis.text.y = element_text(size = 12), 
